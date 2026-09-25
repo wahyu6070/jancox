@@ -2,7 +2,7 @@
 
 Unpack and repack Android ROM zips on Android, Linux and Windows.
 
-Version 3 is a rewrite in Rust: one `jancox` binary with no dependencies. It needs no Python, busybox or Termux packages, and no root. **3.0.0 is a beta.**
+Jancox is one `jancox` binary, written in Rust, with no dependencies. Unpacking and repacking need no root.
 
 - Unpack a flashable ROM zip (`*.new.dat.br` / `*.new.dat` + `*.transfer.list`) into folders you can edit.
 - Repack the folders into a new flashable ROM zip.
@@ -114,7 +114,7 @@ jancox brotli   [-d] [-q quality] [-w window] [-o output] <file>
 
 `repack` uses brotli quality 1 by default, which is fast but gives a bigger zip than most ROMs ship with. Set `brotli.level=6` or higher in `jancox.prop` (or pass `-b 6`) for a smaller zip.
 
-## Limitations (beta)
+## Limitations
 
 - Only ext4 partitions. EROFS ROMs are not supported yet.
 - `payload.bin` ROMs (A/B OTA zips) are not supported yet.

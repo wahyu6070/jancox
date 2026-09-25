@@ -1,5 +1,5 @@
 # changelog
-## 3.0.0 (beta) 25-09-2026
+## 3.0.0 25-09-2026
 - Rewritten in Rust: one `jancox` binary for Android, Linux and Windows; no Python, busybox or Termux packages, no root needed
 - New commands: unpack, repack, cleanup, extract, build, sdat2img, img2sdat, brotli
 - Own ext4 extractor and image builder; owners, modes, SELinux labels and capabilities are kept in config/ metadata files
