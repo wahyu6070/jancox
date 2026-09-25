@@ -1,5 +1,9 @@
 # TODO
 
+## Installing
+
+- Install from a terminal without the Magisk module: Termux (e.g. a Termux package or an install script that puts `jancox` in `$PREFIX/bin`) and Ubuntu/Linux (e.g. a `.deb` or an install script into `/usr/local/bin`).
+
 ## EROFS extractor (postponed)
 
 On hold until there is a real EROFS ROM to test with (payload-based ROMs, Android 12+). Focus on ext4 first.
@@ -12,6 +16,19 @@ On hold until there is a real EROFS ROM to test with (payload-based ROMs, Androi
   - compression: lz4 / lz4hc first (the Android default), then lzma (MicroLZMA) and deflate
   - big pclusters, ztailpacking, fragments (packed inode), dedupe
 - Testing: `erofs-utils` works without sudo: `apt-get download erofs-utils && dpkg-deb -x erofs-utils_*.deb root` gives `mkfs.erofs`, `fsck.erofs` (`--extract` as the reference) and `dump.erofs` (1.7.1 has lz4, lz4hc, lzma, deflate). Check against a real ROM before calling it done.
+
+## Repack
+
+- AVB / dm-verity: a rebuilt partition no longer matches its hashtree and AVB footer (the tail of the partition past the filesystem, and `vbmeta*.img`). Like the old Jancox, the result only boots with verification disabled. Add an option to patch `vbmeta.img` / `vbmeta_system.img` flags (disable verity + verification), or regenerate the hashtree.
+- payload.bin ROMs (A/B): unpack is refused for now.
+- `NewROM-<date>.zip` uses UTC; local time needs a timezone source.
+- A config file for defaults (the old `jancox.prop`: brotli level, zip level).
+- The auto size (`build -s auto`, growing a full dynamic partition) counts file blocks before holes are removed, so it overestimates a little.
+
+## ext4 builder: open points
+
+- Directories are linear (no `dir_index` htree); fine for Android sizes, slower lookups in huge directories.
+- No `shared_blocks` dedup, no hard links (see below).
 
 ## ext4 extractor: open points
 

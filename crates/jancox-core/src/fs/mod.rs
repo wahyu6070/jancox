@@ -3,6 +3,7 @@
 use std::io::{self, Write};
 
 pub mod ext4;
+pub mod mkext4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {

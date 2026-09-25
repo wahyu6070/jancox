@@ -47,7 +47,8 @@ if [ -d /data/data/com.termux/files/usr/bin ]; then
 fi
 
 print " "
-print " How to use? "
-print " Open terminal"
-print " jancox --help"
+print " How to use? Open a terminal (Termux), go to any folder and run:"
+print "   jancox unpack    (reads the ROM zip from ./input/)"
+print "   jancox repack    (writes the new ROM to ./output/)"
+print " More: jancox --help"
 print " "

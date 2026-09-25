@@ -10,6 +10,7 @@ repository = "https://github.com/wahyu6070/Jancox-tool-android"
 
 [workspace.dependencies]
 brotli = "9"
+zip = { version = "8.6", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 sdat2img = { git = "https://github.com/wahyu6070/sdat2img-rust", tag = "v1.0.0" }
 img2sdat = { git = "https://github.com/wahyu6070/img2sdat-rust", tag = "v1.0.0" }
 jancox-core = { path = "crates/jancox-core" }

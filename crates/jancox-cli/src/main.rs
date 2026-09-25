@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process;
 use std::time::Instant;
 
-use jancox_core::{br, dat, extract, img2sdat, sdat};
+use jancox_core::{br, build, dat, extract, img2sdat, rom, sdat};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -19,7 +19,20 @@ macro_rules! out {
 fn usage() {
     out!("Jancox tool {} by wahyu6070\n", VERSION);
     out!("Usage: jancox <command> [args]\n");
-    out!("Commands:");
+    out!(
+        "ROM commands (work folder: -w, default {}):",
+        default_workdir().display()
+    );
+    out!("  unpack [rom.zip] [-w workdir]");
+    out!("      Unpack a ROM zip (default: <workdir>/input/*.zip or input.zip) into editable folders");
+    out!("  repack [-w workdir] [-o out.zip] [-b brotli_quality] [-z zip_level]");
+    out!(
+        "      Build a new ROM zip in <workdir>/output/ (default: -b {} -z 1)",
+        br::DEFAULT_QUALITY
+    );
+    out!("  cleanup [-w workdir] [--all]");
+    out!("      Remove the unpacked files (--all: also <workdir>/output); input/ is kept\n");
+    out!("Tools:");
     out!("  sdat2img <transfer_list> <new_dat> [output_img]");
     out!("      Convert *.new.dat or *.new.dat.br into a raw image (default: system.img)");
     out!("  img2sdat <image> [-o outdir] [-v version] [-p prefix] [-b quality]");
@@ -36,6 +49,9 @@ fn usage() {
     out!("  extract <image> [-o outdir] [-p name]");
     out!("      Extract an ext4 image to <outdir>/<name>/ plus metadata in <outdir>/config/");
     out!("      (default: -o . -p <image name>)");
+    out!("  build <workdir> <part> [-o image] [-s size|auto] [-f]");
+    out!("      Build an ext4 image from <workdir>/<part>/ and <workdir>/config/<part>_*");
+    out!("      (default: -o <workdir>/<part>.img, -s = original size; size in bytes or K/M/G)");
     out!("  help     Show this help");
     out!("  version  Show version");
 }
@@ -236,6 +252,188 @@ fn extract(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn build(args: &[String]) -> Result<(), String> {
+    const USAGE: &str = "usage: jancox build <workdir> <part> [-o image] [-s size|auto] [-f]";
+    let mut positional = Vec::new();
+    let (mut output, mut size, mut force) = (None, build::Size::Original, false);
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        let mut value = || {
+            it.next()
+                .cloned()
+                .ok_or_else(|| format!("{} needs a value\n{}", arg, USAGE))
+        };
+        match arg.as_str() {
+            "-o" | "--output" => output = Some(PathBuf::from(value()?)),
+            "-s" | "--size" => size = value()?.parse()?,
+            "-f" | "--force" => force = true,
+            _ if !arg.starts_with('-') => positional.push(arg.clone()),
+            _ => return Err(format!("unexpected argument: {}\n{}", arg, USAGE)),
+        }
+    }
+    let [work, part] = positional.as_slice() else {
+        return Err(USAGE.into());
+    };
+    let work = PathBuf::from(work);
+    let output = output.unwrap_or_else(|| work.join(format!("{}.img", part)));
+    if output.exists() && !force {
+        return Err(format!(
+            "{} already exists, use -f to overwrite",
+            output.display()
+        ));
+    }
+
+    let start = Instant::now();
+    let sum = build::build(&work, part, &output, size, |msg| out!("{}", msg))
+        .map_err(|e| format!("build failed: {}", e))?;
+    for w in sum.warnings.iter().take(10) {
+        out!("  [warning] {}", w);
+    }
+    if !sum.new_entries.is_empty() {
+        out!(
+            "- {} new entries got default metadata, e.g. {}",
+            sum.new_entries.len(),
+            sum.new_entries
+                .iter()
+                .take(3)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    if sum.removed > 0 {
+        out!("- {} entries from fs_config no longer exist", sum.removed);
+    }
+    let st = &sum.stats;
+    out!(
+        "- Done: {} ({} dirs, {} files, {} symlinks) in {:.2}s",
+        output.display(),
+        sum.dirs,
+        sum.files,
+        sum.symlinks,
+        start.elapsed().as_secs_f64()
+    );
+    out!(
+        "  blocks {}/{} used, inodes {}/{} used",
+        st.used_blocks,
+        st.blocks,
+        st.used_inodes,
+        st.inodes
+    );
+    Ok(())
+}
+
+/// Splits `-w/--workdir` off the arguments.
+/// Default work folder (holds input/ and output/): the folder jancox is run in.
+fn default_workdir() -> PathBuf {
+    PathBuf::from(".")
+}
+
+fn workdir(args: &[String], usage: &str) -> Result<(PathBuf, Vec<String>), String> {
+    let mut work = default_workdir();
+    let mut rest = Vec::new();
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        if arg == "-w" || arg == "--workdir" {
+            work = PathBuf::from(
+                it.next()
+                    .ok_or_else(|| format!("{} needs a value\n{}", arg, usage))?,
+            );
+        } else {
+            rest.push(arg.clone());
+        }
+    }
+    Ok((work, rest))
+}
+
+fn unpack(args: &[String]) -> Result<(), String> {
+    const USAGE: &str = "usage: jancox unpack [rom.zip] [-w workdir]";
+    let (work, rest) = workdir(args, USAGE)?;
+    let input = match rest.as_slice() {
+        [] => match rom::find_input(&work) {
+            Some(zip) => zip,
+            None => {
+                // make the folders so the user knows where the ROM goes
+                let _ = fs::create_dir_all(work.join("input"));
+                let _ = fs::create_dir_all(work.join("output"));
+                return Err(format!(
+                    "no ROM zip found; put it in {} or give its path\n{}",
+                    work.join("input").display(),
+                    USAGE
+                ));
+            }
+        },
+        [zip] if !zip.starts_with('-') => PathBuf::from(zip),
+        _ => return Err(USAGE.into()),
+    };
+    let start = Instant::now();
+    let sum = rom::unpack(&input, &work, |msg| out!("{}", msg))
+        .map_err(|e| format!("unpack failed: {}", e))?;
+    out!(" ");
+    for (k, v) in &sum.rom_info {
+        out!("  {:<16}: {}", k, v);
+    }
+    out!(" ");
+    out!(
+        "- Done in {:.1}s: edit {}/<partition>/, then run: jancox repack",
+        start.elapsed().as_secs_f64(),
+        work.display()
+    );
+    Ok(())
+}
+
+fn repack(args: &[String]) -> Result<(), String> {
+    const USAGE: &str =
+        "usage: jancox repack [-w workdir] [-o out.zip] [-b brotli_quality] [-z zip_level]";
+    let (work, rest) = workdir(args, USAGE)?;
+    let mut opts = rom::RepackOptions::default();
+    let mut output = None;
+    let mut it = rest.iter();
+    while let Some(arg) = it.next() {
+        let mut value = || {
+            it.next()
+                .cloned()
+                .ok_or_else(|| format!("{} needs a value\n{}", arg, USAGE))
+        };
+        match arg.as_str() {
+            "-o" | "--output" => output = Some(PathBuf::from(value()?)),
+            "-b" | "--brotli" => {
+                opts.brotli_quality = value()?.parse().map_err(|_| USAGE.to_string())?
+            }
+            "-z" | "--zip-level" => {
+                opts.zip_level = value()?.parse().map_err(|_| USAGE.to_string())?
+            }
+            _ => return Err(format!("unexpected argument: {}\n{}", arg, USAGE)),
+        }
+    }
+    let start = Instant::now();
+    let zip = rom::repack(&work, output.as_deref(), opts, |msg| out!("{}", msg))
+        .map_err(|e| format!("repack failed: {}", e))?;
+    out!(
+        "- Done in {:.1}s: {} ({} bytes)",
+        start.elapsed().as_secs_f64(),
+        zip.display(),
+        file_size(&zip)
+    );
+    Ok(())
+}
+
+fn cleanup(args: &[String]) -> Result<(), String> {
+    const USAGE: &str = "usage: jancox cleanup [-w workdir] [--all]";
+    let (work, rest) = workdir(args, USAGE)?;
+    let all = match rest.as_slice() {
+        [] => false,
+        [a] if a == "--all" => true,
+        _ => return Err(USAGE.into()),
+    };
+    let removed = rom::cleanup(&work, all).map_err(|e| format!("cleanup failed: {}", e))?;
+    for p in &removed {
+        out!("   Removing -> {}", p.display());
+    }
+    out!("- Done ({} removed)", removed.len());
+    Ok(())
+}
+
 fn file_size(path: &Path) -> u64 {
     fs::metadata(path).map(|m| m.len()).unwrap_or(0)
 }
@@ -244,10 +442,14 @@ fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
 
     let result = match args.first().map(String::as_str) {
+        Some("unpack") => unpack(&args[1..]),
+        Some("repack") => repack(&args[1..]),
+        Some("cleanup") => cleanup(&args[1..]),
         Some("sdat2img") => sdat2img(&args[1..]),
         Some("img2sdat") => img2sdat(&args[1..]),
         Some("brotli") => brotli(&args[1..]),
         Some("extract") => extract(&args[1..]),
+        Some("build") => build(&args[1..]),
         Some("-V" | "--version" | "version") => {
             out!("jancox {}", VERSION);
             Ok(())

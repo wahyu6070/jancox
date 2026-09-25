@@ -102,7 +102,7 @@ fn read_up_to(r: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
 
 /// Mount point from the volume name: "/" stays, "vendor" -> "/vendor",
 /// empty -> "/<part>".
-fn mount_point(volume: &str, part: &str) -> String {
+pub(crate) fn mount_point(volume: &str, part: &str) -> String {
     let v = volume.trim();
     if v.starts_with('/') {
         v.to_string()
@@ -149,6 +149,15 @@ pub fn extract_fs<F: Filesystem>(
     let mut stack = vec![(Vec::new(), fs.root())];
 
     while let Some((rel, node)) = stack.pop() {
+        // lost+found: keep its metadata (owner, label) for the rebuild, but
+        // not the folder; the image builder recreates it
+        if rel == b"lost+found" {
+            let meta = fs.meta(node)?;
+            if meta.kind == Kind::Dir {
+                entries.insert(rel, Entry { meta, link: None });
+                continue;
+            }
+        }
         let host = host_path(&root_dir, &rel);
         let (meta, link) =
             extract_one(fs, node, &rel, &host, part, &mut stack, &mut sum).map_err(|e| {
@@ -193,10 +202,6 @@ fn extract_one<F: Filesystem>(
             let mut children = fs.read_dir(node)?;
             children.sort_by(|a, b| a.0.cmp(&b.0));
             for (name, child) in children.into_iter().rev() {
-                // mke2fs / e2fsdroid recreate lost+found
-                if rel.is_empty() && name == b"lost+found" {
-                    continue;
-                }
                 let mut path = rel.to_vec();
                 if !path.is_empty() {
                     path.push(b'/');
@@ -254,15 +259,8 @@ fn write_config(
             ));
         }
         // device path, e.g. /vendor/bin/sh or /system/bin/sh on system-as-root
-        let device = match (mount, rel.is_empty()) {
-            (_, true) => mount.to_string(),
-            ("/", false) => format!("/{}", rel_str),
-            (_, false) => format!("{}/{}", mount, rel_str),
-        };
-        let config_path = match device.trim_start_matches('/') {
-            "" => "/",
-            p => p,
-        };
+        let device = device_path(mount, &rel_str);
+        let config_path = config_path(&device);
 
         let m = &e.meta;
         write!(
@@ -289,6 +287,25 @@ fn write_config(
     fs_config.flush()?;
     contexts.flush()?;
     symlinks.flush()
+}
+
+/// Device path of `rel` (relative to the image root, "" for the root),
+/// e.g. `/vendor/bin/sh`, or `/system/bin/sh` on system-as-root.
+pub(crate) fn device_path(mount: &str, rel: &str) -> String {
+    match (mount, rel.is_empty()) {
+        (_, true) => mount.to_string(),
+        ("/", false) => format!("/{}", rel),
+        (_, false) => format!("{}/{}", mount, rel),
+    }
+}
+
+/// fs_config path: the device path without its leading "/" ("/" for the
+/// root of system-as-root).
+pub(crate) fn config_path(device: &str) -> &str {
+    match device.trim_start_matches('/') {
+        "" => "/",
+        p => p,
+    }
 }
 
 /// Escapes regex metacharacters for file_contexts, e.g. `libc++.so` -> `libc\+\+\.so`.

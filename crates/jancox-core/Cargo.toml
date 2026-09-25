@@ -10,3 +10,4 @@ repository.workspace = true
 brotli.workspace = true
 img2sdat.workspace = true
 sdat2img.workspace = true
+zip.workspace = true

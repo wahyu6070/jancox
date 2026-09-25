@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 #
-# Cross-compile jancox release binaries for Linux, Android and Windows, and
-# pack the Magisk/recovery flashable module (android/ + the Android binaries).
+# Cross-compile jancox for Android, Linux and Windows and pack one zip per
+# platform. The Android zip is the Magisk/recovery flashable module
+# (android/ + bin/<arch>/jancox for every Android architecture).
 #
-# Usage: ./build.sh [all|module|linux|android|windows|<target-name>...]
+# Usage: ./build.sh [all|android|linux|windows|<target-name>...]
 #        ./build.sh --list
 #
 # Requirements:
@@ -12,8 +13,9 @@
 #   - Android NDK (r23+)          Android targets; set ANDROID_NDK_HOME or put it in ~/Android
 #   - zip
 #
-# Output: dist/jancox-<os>.zip (one folder per architecture inside),
-#         dist/Jancox-tool-android-<version>.zip (flashable module) and
+# Output: dist/Jancox-tool-android-v<version>.zip         flashable module
+#         dist/Jancox-tool-linux-<arch>-v<version>.zip    jancox + input/ + output/
+#         dist/Jancox-tool-windows-<arch>-v<version>.zip  jancox.exe + input/ + output/
 #         dist/SHA256SUMS
 
 set -euo pipefail
@@ -52,7 +54,7 @@ warn() { echo "${YELLOW}warning:${RESET} $*" >&2; }
 die() { echo "${RED}error:${RESET} $*" >&2; exit 1; }
 
 usage() {
-    sed -n '3,17p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '3,19p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 # Locate the Android NDK: explicit env vars first, then common install paths.
@@ -169,19 +171,21 @@ build_one() {
     cp "target/$triple/release/$BIN$ext" "$dir/$BIN$ext"
 }
 
-# Zip each OS folder in the staging area into dist/jancox-<os>.zip
+# One zip per Linux/Windows architecture with the binary at the top and
+# empty input/ and output/ folders; run jancox from that folder. Android is
+# packed as the module.
 package() {
-    local os_dir os zipfile
-    for os_dir in "$STAGE"/*/; do
-        [[ -d "$os_dir" ]] || continue
-        os=$(basename "$os_dir")
-        zipfile="$PWD/$DIST/$BIN-$os.zip"
-        for doc in README.md LICENSE; do
-            [[ -f $doc ]] && cp "$doc" "$os_dir"
-        done
+    local arch_dir os arch zipfile dir
+    for arch_dir in "$STAGE"/*/*/; do
+        [[ -d "$arch_dir" ]] || continue
+        arch=$(basename "$arch_dir")
+        os=$(basename "$(dirname "$arch_dir")")
+        [[ $os == android ]] && continue
+        mkdir -p "$arch_dir/input" "$arch_dir/output"
+        zipfile="$PWD/$DIST/Jancox-tool-$os-$arch-v$VERSION.zip"
         rm -f "$zipfile"
-        (cd "$os_dir" && zip -q -r -9 -X "$zipfile" .)
-        info "Packaged $DIST/$BIN-$os.zip"
+        (cd "$arch_dir" && zip -q -r -9 -X "$zipfile" .)
+        info "Packaged $DIST/$(basename "$zipfile")"
     done
 }
 
@@ -192,6 +196,8 @@ package_module() {
     local version zipfile entry name triple stage=target/module
     version=$(sed -n 's/^version=//p' "$MODULE_DIR/module.prop")
     [[ -n $version ]] || { echo "version not found in $MODULE_DIR/module.prop" >&2; return 1; }
+    [[ $version == "v$VERSION" ]] ||
+        warn "$MODULE_DIR/module.prop has version $version but Cargo.toml has $VERSION"
 
     rm -rf "$stage"
     cp -a "$MODULE_DIR" "$stage"
@@ -224,55 +230,58 @@ main() {
             ;;
     esac
 
-    # "module" builds the Android targets and packs the flashable zip;
-    # "all" (the default) builds everything.
-    local arg want_module=0 targets=()
+    # "module" is an old name for "android"
+    local arg targets=()
     for arg in "${@:-all}"; do
-        case $arg in
-            module) want_module=1; targets+=(android) ;;
-            all) want_module=1; targets+=(all) ;;
-            *) targets+=("$arg") ;;
-        esac
+        [[ $arg == module ]] && arg=android
+        targets+=("$arg")
     done
 
     local entry name triple builder ok=() failed=()
     mkdir -p "$DIST"
+    rm -f "$DIST"/*.zip "$DIST"/SHA256SUMS
 
-    if [[ ${#targets[@]} -gt 0 ]]; then
-        select_targets "${targets[@]}"
-        check_prereqs
+    select_targets "${targets[@]}"
+    check_prereqs
 
-        rm -rf "$STAGE"
-        mkdir -p "$STAGE"
-        info "Building $BIN $VERSION for ${#SELECTED[@]} target(s)"
+    rm -rf "$STAGE"
+    mkdir -p "$STAGE"
+    info "Building $BIN $VERSION for ${#SELECTED[@]} target(s)"
 
-        for entry in "${SELECTED[@]}"; do
-            IFS='|' read -r name triple builder <<<"$entry"
-            info "Building ${BOLD}$name${RESET} ($triple)"
-            if (set -e; build_one "$name" "$triple" "$builder"); then
-                ok+=("$name")
-            else
-                failed+=("$name")
-                warn "build failed: $name"
-            fi
-        done
-
-        [[ ${#ok[@]} -gt 0 ]] && package
-    fi
-
-    if [[ $want_module -eq 1 ]]; then
-        command -v zip >/dev/null || die "zip not found. Install it with: sudo apt install zip"
-        if [[ " ${failed[*]:-} " == *" android-"* ]]; then
-            failed+=(module)
-            warn "module skipped: an Android build failed"
-        elif package_module; then
-            ok+=(module)
+    for entry in "${SELECTED[@]}"; do
+        IFS='|' read -r name triple builder <<<"$entry"
+        info "Building ${BOLD}$name${RESET} ($triple)"
+        if (set -e; build_one "$name" "$triple" "$builder"); then
+            ok+=("$name")
         else
-            failed+=(module)
+            failed+=("$name")
+            warn "build failed: $name"
         fi
+    done
+
+    [[ ${#ok[@]} -gt 0 ]] && package
+
+    # the module needs a binary for every Android architecture
+    local android_ok=0 android_all=0
+    for entry in "${TARGETS[@]}"; do
+        name=${entry%%|*}
+        [[ $name == android-* ]] || continue
+        android_all=$((android_all + 1))
+        [[ " ${ok[*]:-} " == *" $name "* ]] && android_ok=$((android_ok + 1))
+    done
+    if [[ $android_ok -eq $android_all ]]; then
+        if package_module; then
+            ok+=(android-module)
+        else
+            failed+=(android-module)
+        fi
+    elif [[ $android_ok -gt 0 ]]; then
+        warn "Android module not packed: it needs all $android_all Android targets (./build.sh android)"
     fi
 
-    (cd "$DIST" && rm -f SHA256SUMS && sha256sum *.zip >SHA256SUMS)
+    if compgen -G "$DIST/*.zip" >/dev/null; then
+        (cd "$DIST" && sha256sum *.zip >SHA256SUMS)
+    fi
 
     echo
     info "Summary"
