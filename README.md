@@ -23,32 +23,35 @@ Get the zips from [Releases](https://github.com/wahyu6070/Jancox-tool-android/re
 
 `jancox` works in the folder you run it from (or the folder given with `-w`).
 
-1. Put the ROM zip in `input/`.
-2. `jancox unpack`
-3. Edit the files in the partition folders (`system/`, `vendor/`, `product/`, ...).
-4. `jancox repack`. The new ROM is written to `output/NewROM-<date>.zip`.
-5. `jancox cleanup` removes the unpacked files. It keeps `input/` and `output/` (`--all` also removes `output/`).
+1. `jancox init` makes `input/`, `output/` and `jancox.prop` (optional; `unpack` does it too when no ROM is found).
+2. Put the ROM zip in `input/`.
+3. `jancox unpack`
+4. Edit the files in `partition/system/`, `partition/vendor/`, `partition/product/`, ...
+5. `jancox repack`. The new ROM is written to `output/NewROM-<date>.zip`.
+6. `jancox cleanup` removes the unpacked files. It keeps `input/`, `output/` and `jancox.prop` (`--all` also removes `output/`).
 
 After `unpack` the folder looks like this:
 
 ```
-input/                     your ROM zip
-rom/                       the rest of the ROM (META-INF, boot.img, firmware, ...)
-system/ vendor/ ...        partition files, edit these
-config/<part>_fs_config    owner, group, mode, capabilities
-config/<part>_file_contexts SELinux labels
-config/<part>_symlinks     symlinks
-config/<part>_info         filesystem parameters (size, UUID, ...)
-output/                    new ROMs
+input/                               your ROM zip
+output/                              new ROMs
+jancox.prop                          settings (brotli.level, zip.level; default 1)
+rom/                                 the rest of the ROM (META-INF, boot.img, firmware, ...)
+partition/system/ vendor/ ...        partition files, edit these
+partition/config/<part>_fs_config    owner, group, mode, capabilities
+partition/config/<part>_file_contexts SELinux labels
+partition/config/<part>_symlinks     symlinks
+partition/config/<part>_info         filesystem parameters (size, UUID, ...)
 ```
 
-- Added files get default owners and modes (`0 0 0644`, or `0 2000 0755` in `bin/`) and the SELinux label of their folder. To change them, edit `config/<part>_fs_config` and `config/<part>_file_contexts`.
+- Added files get default owners and modes (`0 0 0644`, or `0 2000 0755` in `bin/`) and the SELinux label of their folder. To change them, edit `partition/config/<part>_fs_config` and `<part>_file_contexts`.
 - Deleted files are left out of the new image.
-- A symlink listed in `config/<part>_symlinks` stays even where the folder can't hold symlinks (Windows, `/sdcard`). Remove its line to delete it.
+- Where the storage can't hold symlinks (`/sdcard`, Windows), `unpack` says so, and symlinks live only in `partition/config/<part>_symlinks`; `repack` puts them back. Remove a line there to delete a symlink. Working in a folder with symlink support (e.g. the Termux home `~`) shows them as real symlinks.
 
 ### Commands
 
 ```
+jancox init     [-w workdir]
 jancox unpack   [rom.zip] [-w workdir]
 jancox repack   [-w workdir] [-o out.zip] [-b brotli_quality] [-z zip_level]
 jancox cleanup  [-w workdir] [--all]
@@ -60,7 +63,7 @@ jancox img2sdat <image> [-o outdir] [-v version] [-p prefix] [-b quality]
 jancox brotli   [-d] [-q quality] [-w window] [-o output] <file>
 ```
 
-`repack` uses brotli quality 1 by default, which is fast but gives a bigger zip than most ROMs ship with. Use `-b 6` or higher for a smaller zip.
+`repack` uses brotli quality 1 by default, which is fast but gives a bigger zip than most ROMs ship with. Set `brotli.level=6` or higher in `jancox.prop` (or pass `-b 6`) for a smaller zip.
 
 ## Limitations (beta)
 

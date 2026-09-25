@@ -23,13 +23,12 @@ fn usage() {
         "ROM commands (work folder: -w, default {}):",
         default_workdir().display()
     );
+    out!("  init [-w workdir]");
+    out!("      Make input/, output/ and jancox.prop (brotli/zip levels) if missing");
     out!("  unpack [rom.zip] [-w workdir]");
     out!("      Unpack a ROM zip (default: <workdir>/input/*.zip or input.zip) into editable folders");
     out!("  repack [-w workdir] [-o out.zip] [-b brotli_quality] [-z zip_level]");
-    out!(
-        "      Build a new ROM zip in <workdir>/output/ (default: -b {} -z 1)",
-        br::DEFAULT_QUALITY
-    );
+    out!("      Build a new ROM zip in <workdir>/output/ (default: jancox.prop, else -b 1 -z 1)");
     out!("  cleanup [-w workdir] [--all]");
     out!("      Remove the unpacked files (--all: also <workdir>/output); input/ is kept\n");
     out!("Tools:");
@@ -353,9 +352,8 @@ fn unpack(args: &[String]) -> Result<(), String> {
         [] => match rom::find_input(&work) {
             Some(zip) => zip,
             None => {
-                // make the folders so the user knows where the ROM goes
-                let _ = fs::create_dir_all(work.join("input"));
-                let _ = fs::create_dir_all(work.join("output"));
+                // set up the folder so the user knows where the ROM goes
+                let _ = rom::init(&work);
                 return Err(format!(
                     "no ROM zip found; put it in {} or give its path\n{}",
                     work.join("input").display(),
@@ -375,9 +373,9 @@ fn unpack(args: &[String]) -> Result<(), String> {
     }
     out!(" ");
     out!(
-        "- Done in {:.1}s: edit {}/<partition>/, then run: jancox repack",
+        "- Done in {:.1}s: edit {}/<name>/, then run: jancox repack",
         start.elapsed().as_secs_f64(),
-        work.display()
+        rom::partition_dir(&work).display()
     );
     Ok(())
 }
@@ -386,7 +384,7 @@ fn repack(args: &[String]) -> Result<(), String> {
     const USAGE: &str =
         "usage: jancox repack [-w workdir] [-o out.zip] [-b brotli_quality] [-z zip_level]";
     let (work, rest) = workdir(args, USAGE)?;
-    let mut opts = rom::RepackOptions::default();
+    let mut opts = rom::load_config(&work).map_err(|e| format!("repack failed: {}", e))?;
     let mut output = None;
     let mut it = rest.iter();
     while let Some(arg) = it.next() {
@@ -418,6 +416,26 @@ fn repack(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn init(args: &[String]) -> Result<(), String> {
+    const USAGE: &str = "usage: jancox init [-w workdir]";
+    let (work, rest) = workdir(args, USAGE)?;
+    if !rest.is_empty() {
+        return Err(USAGE.into());
+    }
+    let made = rom::init(&work).map_err(|e| format!("init failed: {}", e))?;
+    for p in &made {
+        out!("   Created -> {}", p.display());
+    }
+    if made.is_empty() {
+        out!("- Nothing to do: input/, output/ and jancox.prop already exist");
+    }
+    out!(
+        "- Put the ROM zip in {}, then run: jancox unpack",
+        work.join("input").display()
+    );
+    Ok(())
+}
+
 fn cleanup(args: &[String]) -> Result<(), String> {
     const USAGE: &str = "usage: jancox cleanup [-w workdir] [--all]";
     let (work, rest) = workdir(args, USAGE)?;
@@ -442,6 +460,7 @@ fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
 
     let result = match args.first().map(String::as_str) {
+        Some("init") => init(&args[1..]),
         Some("unpack") => unpack(&args[1..]),
         Some("repack") => repack(&args[1..]),
         Some("cleanup") => cleanup(&args[1..]),

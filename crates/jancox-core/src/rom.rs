@@ -3,7 +3,8 @@
 //!
 //! ```text
 //! <work>/rom/                  the rest of the ROM zip (META-INF, boot.img, firmware, ...)
-//! <work>/<part>/, <work>/config/  extracted partitions (see extract.rs)
+//! <work>/partition/<part>/     extracted partitions, and their metadata in
+//! <work>/partition/config/     (see extract.rs)
 //! <work>/jancox_rom            what unpack found, for repack (key=value)
 //! <work>/tmp/                  images while building
 //! <work>/output/NewROM-<date>.zip
@@ -61,6 +62,11 @@ fn state_path(work: &Path) -> PathBuf {
     work.join(STATE)
 }
 
+/// Folder holding the extracted partitions and their `config/`.
+pub fn partition_dir(work: &Path) -> PathBuf {
+    work.join("partition")
+}
+
 fn write_state(work: &Path, input: &Path, parts: &[Partition]) -> io::Result<()> {
     let mut s = format!("input={}\n", input.display());
     let names: Vec<&str> = parts.iter().map(|p| p.name.as_str()).collect();
@@ -101,6 +107,73 @@ pub fn read_state(work: &Path) -> io::Result<Option<Vec<Partition>>> {
         });
     }
     Ok(Some(parts))
+}
+
+const CONFIG: &str = "jancox.prop";
+
+const DEFAULT_CONFIG: &str = "\
+# Jancox tool settings, read by `jancox repack`.
+# Command line options (-b, -z) win over these.
+
+# brotli quality for <partition>.new.dat.br: 0 (fastest) - 11 (smallest)
+brotli.level=1
+
+# deflate level for the other files in the ROM zip: 0 (store) - 9 (smallest)
+zip.level=1
+";
+
+/// Creates `input/`, `output/` and a default `jancox.prop` in `work`, each
+/// only when missing. Returns what was created.
+pub fn init(work: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut created = Vec::new();
+    for dir in ["input", "output"] {
+        let p = work.join(dir);
+        if !p.is_dir() {
+            fs::create_dir_all(&p)?;
+            created.push(p);
+        }
+    }
+    let prop = work.join(CONFIG);
+    if !prop.exists() {
+        fs::write(&prop, DEFAULT_CONFIG)?;
+        created.push(prop);
+    }
+    Ok(created)
+}
+
+/// Repack options from `<work>/jancox.prop`; defaults when it is missing.
+pub fn load_config(work: &Path) -> io::Result<RepackOptions> {
+    let path = work.join(CONFIG);
+    let text = match fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(RepackOptions::default()),
+        Err(e) => return Err(e),
+    };
+    let mut opts = RepackOptions::default();
+    for (n, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let bad = || invalid(format!("{} line {}: {}", CONFIG, n + 1, line));
+        let (key, value) = line.split_once('=').ok_or_else(bad)?;
+        let value = value.trim();
+        match key.trim() {
+            "brotli.level" => {
+                opts.brotli_quality = value.parse().ok().filter(|q| *q <= 11).ok_or_else(bad)?
+            }
+            "zip.level" => {
+                opts.zip_level = value
+                    .parse()
+                    .ok()
+                    .filter(|z| (0..=9).contains(z))
+                    .ok_or_else(bad)?
+            }
+            // unknown keys are ignored, so newer settings don't break older builds
+            _ => {}
+        }
+    }
+    Ok(opts)
 }
 
 /// Looks for the ROM zip: `<work>/input/*.zip`, then `<work>/input.zip`.
@@ -176,6 +249,12 @@ pub fn unpack(input: &Path, work: &Path, mut log: impl FnMut(&str)) -> io::Resul
         ));
     }
     log(&format!("- ROM: {}", input.display()));
+    fs::create_dir_all(work)?;
+    if !extract::symlinks_supported(work) {
+        log("[!] This partition/storage does not support symlinks (e.g. /sdcard).");
+        log("    Symlinks are kept in config/<part>_symlinks and put back on repack.");
+        log("    To see them as real symlinks, work in a folder like the Termux home (~).");
+    }
 
     // everything else goes to <work>/rom as is
     let rom_dir = work.join("rom");
@@ -239,13 +318,18 @@ pub fn unpack(input: &Path, work: &Path, mut log: impl FnMut(&str)) -> io::Resul
             sdat::write_img(&list, &mut reader, &img, |_| {})
                 .map_err(|e| invalid(format!("{}: {}", dat, e)))?;
         }
-        let sum = extract::extract(&img, work, Some(&p.name), &mut log)?;
+        let sum = extract::extract(&img, &partition_dir(work), Some(&p.name), &mut log)?;
         for w in sum.warnings.iter().take(5) {
             log(&format!("  [warning] {}", w));
         }
+        let kept = if sum.symlinks_not_created > 0 {
+            " (in config only)"
+        } else {
+            ""
+        };
         log(&format!(
-            "  {} dirs, {} files, {} symlinks",
-            sum.dirs, sum.files, sum.symlinks
+            "  {} dirs, {} files, {} symlinks{}",
+            sum.dirs, sum.files, sum.symlinks, kept
         ));
         fs::remove_file(&img)?;
     }
@@ -267,6 +351,7 @@ fn prop(path: &Path, key: &str) -> Option<String> {
 
 /// Android version, ROM name and device from the extracted build.props.
 pub fn rom_info(work: &Path) -> Vec<(String, String)> {
+    let work = &partition_dir(work);
     let system = [
         work.join("system/system/build.prop"),
         work.join("system/build.prop"),
@@ -409,14 +494,15 @@ pub fn repack(
         let mut new_sizes = BTreeMap::new();
         for p in &parts {
             let img = tmp.join(format!("{}.img", p.name));
-            let built = build::build(work, &p.name, &img, Size::Original, &mut log);
+            let parts_dir = partition_dir(work);
+            let built = build::build(&parts_dir, &p.name, &img, Size::Original, &mut log);
             let sum = match built {
                 Err(e) if e.kind() == io::ErrorKind::StorageFull && op_list.is_some() => {
                     log(&format!(
                         "- {} is full, growing it (dynamic partition)",
                         p.name
                     ));
-                    build::build(work, &p.name, &img, Size::Auto, &mut log)?
+                    build::build(&parts_dir, &p.name, &img, Size::Auto, &mut log)?
                 }
                 Err(e) if e.kind() == io::ErrorKind::StorageFull => {
                     return Err(io::Error::new(
@@ -540,12 +626,17 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) -> i
 /// Removes what unpack and repack created in `work`. `input/` is never
 /// touched; `output/` only with `all`. Returns the removed paths.
 pub fn cleanup(work: &Path, all: bool) -> io::Result<Vec<PathBuf>> {
-    let mut targets: Vec<PathBuf> = ["rom", "tmp", "config"]
+    let mut targets: Vec<PathBuf> = ["rom", "tmp", "partition"]
         .iter()
         .map(|d| work.join(d))
         .collect();
     if let Some(parts) = read_state(work)? {
-        targets.extend(parts.iter().map(|p| work.join(&p.name)));
+        // an unpack by 3.0.0 beta put the partitions and config/ straight
+        // into <work>; only then are those folders ours to remove
+        if !partition_dir(work).exists() {
+            targets.extend(parts.iter().map(|p| work.join(&p.name)));
+            targets.push(work.join("config"));
+        }
     }
     targets.push(state_path(work));
     if all {
@@ -590,6 +681,33 @@ mod tests {
     fn op_list_group_limit() {
         let sizes = BTreeMap::from([("system".to_string(), 7500u64)]);
         assert!(update_op_list(OPS, &sizes).is_err());
+    }
+
+    #[test]
+    fn config_file() {
+        let dir = std::env::temp_dir().join(format!("jancox-init-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // missing file: defaults
+        let d = load_config(&dir).unwrap();
+        assert_eq!((d.brotli_quality, d.zip_level), (1, 1));
+
+        let made = init(&dir).unwrap();
+        assert_eq!(made.len(), 3);
+        assert!(init(&dir).unwrap().is_empty(), "init keeps what exists");
+        let d = load_config(&dir).unwrap();
+        assert_eq!((d.brotli_quality, d.zip_level), (1, 1));
+
+        fs::write(
+            dir.join(CONFIG),
+            "# x\nbrotli.level = 6\nzip.level=9\nnew.key=1\n",
+        )
+        .unwrap();
+        let c = load_config(&dir).unwrap();
+        assert_eq!((c.brotli_quality, c.zip_level), (6, 9));
+        fs::write(dir.join(CONFIG), "brotli.level=12\n").unwrap();
+        assert!(load_config(&dir).is_err());
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

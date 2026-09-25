@@ -22,7 +22,6 @@ On hold until there is a real EROFS ROM to test with (payload-based ROMs, Androi
 - AVB / dm-verity: a rebuilt partition no longer matches its hashtree and AVB footer (the tail of the partition past the filesystem, and `vbmeta*.img`). Like the old Jancox, the result only boots with verification disabled. Add an option to patch `vbmeta.img` / `vbmeta_system.img` flags (disable verity + verification), or regenerate the hashtree.
 - payload.bin ROMs (A/B): unpack is refused for now.
 - `NewROM-<date>.zip` uses UTC; local time needs a timezone source.
-- A config file for defaults (the old `jancox.prop`: brotli level, zip level).
 - The auto size (`build -s auto`, growing a full dynamic partition) counts file blocks before holes are removed, so it overestimates a little.
 
 ## ext4 builder: open points

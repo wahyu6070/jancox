@@ -34,6 +34,9 @@ pub struct Summary {
     pub dirs: u64,
     pub files: u64,
     pub symlinks: u64,
+    /// Symlinks only kept in `<part>_symlinks` because the output folder
+    /// can't hold symlinks (`/sdcard`, Windows).
+    pub symlinks_not_created: u64,
     /// Device nodes, fifos and sockets: only recorded in fs_config.
     pub special: u64,
     pub bytes: u64,
@@ -218,13 +221,25 @@ fn extract_one<F: Filesystem>(
         }
         Kind::Symlink => {
             let target = fs.read_link(node)?;
-            if let Err(e) = make_symlink(&target, host) {
-                sum.warnings.push(format!(
-                    "symlink {} not created ({}), kept in {}_symlinks",
-                    String::from_utf8_lossy(rel),
-                    e,
-                    part
-                ));
+            if sum.symlinks_not_created > 0 {
+                // the folder can't hold symlinks; don't try every one
+                sum.symlinks_not_created += 1;
+            } else if let Err(e) = make_symlink(&target, host) {
+                if symlinks_unsupported(&e) {
+                    sum.symlinks_not_created += 1;
+                    sum.warnings.push(format!(
+                        "this partition/storage does not support symlinks ({}); they are \
+                         kept in config/{}_symlinks and put back on repack",
+                        e, part
+                    ));
+                } else {
+                    sum.warnings.push(format!(
+                        "symlink {} not created ({}), kept in config/{}_symlinks",
+                        String::from_utf8_lossy(rel),
+                        e,
+                        part
+                    ));
+                }
             }
             link = Some(target);
             sum.symlinks += 1;
@@ -350,6 +365,29 @@ fn host_path(root: &Path, rel: &[u8]) -> PathBuf {
     p
 }
 
+/// Tries to make a symlink in `dir`. False when its filesystem refuses them
+/// (Android's /sdcard, FAT/exFAT, Windows without the privilege).
+pub fn symlinks_supported(dir: &Path) -> bool {
+    let probe = dir.join(".jancox-symlink-test");
+    let _ = fs::remove_file(&probe);
+    let ok = make_symlink(b"jancox", &probe).is_ok();
+    let _ = fs::remove_file(&probe);
+    ok
+}
+
+/// True when an error means the filesystem refuses symlinks altogether
+/// (FAT/exFAT, Android's /sdcard, Windows without the privilege).
+fn symlinks_unsupported(e: &io::Error) -> bool {
+    const EPERM: i32 = 1;
+    const EACCES: i32 = 13;
+    const ENOSYS: i32 = 38;
+    const EOPNOTSUPP: i32 = 95;
+    matches!(
+        e.kind(),
+        io::ErrorKind::PermissionDenied | io::ErrorKind::Unsupported
+    ) || matches!(e.raw_os_error(), Some(EPERM | EACCES | ENOSYS | EOPNOTSUPP))
+}
+
 #[cfg(unix)]
 fn make_symlink(target: &[u8], at: &Path) -> io::Result<()> {
     std::os::unix::fs::symlink(host_name(target), at)
@@ -373,6 +411,26 @@ mod tests {
         assert_eq!(mount_point("vendor", "vendor"), "/vendor");
         assert_eq!(mount_point("", "product"), "/product");
         assert_eq!(mount_point("/odm", "x"), "/odm");
+    }
+
+    #[test]
+    fn symlink_errors() {
+        let denied = io::Error::from_raw_os_error(13);
+        assert!(symlinks_unsupported(&denied));
+        let unsupported = io::Error::new(io::ErrorKind::Unsupported, "no");
+        assert!(symlinks_unsupported(&unsupported));
+        let exists = io::Error::from_raw_os_error(17);
+        assert!(!symlinks_unsupported(&exists));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_probe() {
+        let dir = std::env::temp_dir().join(format!("jancox-probe-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        assert!(symlinks_supported(&dir));
+        assert!(!dir.join(".jancox-symlink-test").exists());
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
