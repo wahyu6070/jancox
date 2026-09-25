@@ -2,7 +2,7 @@
 
 ## Installing
 
-- Install from a terminal without the Magisk module: Termux (e.g. a Termux package or an install script that puts `jancox` in `$PREFIX/bin`) and Ubuntu/Linux (e.g. a `.deb` or an install script into `/usr/local/bin`).
+- `install.sh` covers Linux and Termux (plain binaries in the release + SHA256SUMS). Still open: a PowerShell one-liner for Windows, and maybe a Termux package / `.deb`.
 
 ## EROFS extractor (postponed)
 

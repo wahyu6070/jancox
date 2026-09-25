@@ -29,3 +29,4 @@ Unpack/repack Android ROMs. Being rewritten from shell + Python into a single Ru
 
 - This repo only uses one branch: `master`. Work and commit directly on `master`; don't create feature branches.
 - Don't rename `master` to `main`: the `updateJson` URL points at `refs/heads/master`.
+- The repo was renamed from `Jancox-tool-android` to `jancox` (2026-09-25). GitHub redirects the old URLs, and installed v2.5 modules still poll the old `updateJson` URL through that redirect: never create a new repo named `Jancox-tool-android`. Use `wahyu6070/jancox` in new URLs.

@@ -9,15 +9,36 @@ Version 3 is a rewrite in Rust: one `jancox` binary with no dependencies. It nee
 - Keeps owners, permissions, SELinux labels and capabilities in metadata files, so it works on `/sdcard` and on Windows too.
 - Grows full dynamic partitions and updates `dynamic_partitions_op_list`.
 
+## Install
+
+**Linux (Ubuntu, Debian, ...) and Termux**: one line, installs `jancox` into `/usr/local/bin` (Linux, asks for sudo) or `$PREFIX/bin` (Termux):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/wahyu6070/jancox/master/install.sh | sh
+```
+
+It picks the binary for your CPU and checks its SHA256. Options go after `sh -s --`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/wahyu6070/jancox/master/install.sh | sh -s -- --version v3.0.0
+curl -fsSL https://raw.githubusercontent.com/wahyu6070/jancox/master/install.sh | sh -s -- --dir ~/.local/bin
+curl -fsSL https://raw.githubusercontent.com/wahyu6070/jancox/master/install.sh | sh -s -- --uninstall
+```
+
+**Android with root**: flash `Jancox-tool-android-v<version>.zip` in Magisk (or KernelSU / APatch / recovery).
+
+**Windows**: download the zip below, extract it, and run `jancox.exe` from cmd or PowerShell in that folder.
+
 ## Download
 
-Get the zips from [Releases](https://github.com/wahyu6070/Jancox-tool-android/releases).
+Get the zips from [Releases](https://github.com/wahyu6070/jancox/releases).
 
 | File | What it is |
 |------|------------|
 | `Jancox-tool-android-v<version>.zip` | Magisk / recovery module. Installs `jancox` for the device's CPU (arm, arm64, x86, x86_64) into `/system/bin`, and into Termux when it is installed. |
 | `Jancox-tool-linux-<arch>-v<version>.zip` | `jancox` + empty `input/` and `output/`. Static binary, `arch` = `x86_64`, `arm64`, `x86`, `arm`. |
 | `Jancox-tool-windows-<arch>-v<version>.zip` | `jancox.exe` + empty `input/` and `output/`. `arch` = `x86_64`, `x86`, `arm64`. |
+| `jancox-<os>-<arch>` | The plain binaries, used by `install.sh`. |
 
 ## Usage
 

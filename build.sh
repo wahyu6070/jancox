@@ -16,6 +16,7 @@
 # Output: dist/Jancox-tool-android-v<version>.zip         flashable module
 #         dist/Jancox-tool-linux-<arch>-v<version>.zip    jancox + input/ + output/
 #         dist/Jancox-tool-windows-<arch>-v<version>.zip  jancox.exe + input/ + output/
+#         dist/jancox-<os>-<arch>[.exe]                  plain binaries (for install.sh)
 #         dist/SHA256SUMS
 
 set -euo pipefail
@@ -54,7 +55,7 @@ warn() { echo "${YELLOW}warning:${RESET} $*" >&2; }
 die() { echo "${RED}error:${RESET} $*" >&2; exit 1; }
 
 usage() {
-    sed -n '3,19p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '3,20p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 # Locate the Android NDK: explicit env vars first, then common install paths.
@@ -169,6 +170,8 @@ build_one() {
     local dir="$STAGE/${name%%-*}/${name#*-}"
     mkdir -p "$dir"
     cp "target/$triple/release/$BIN$ext" "$dir/$BIN$ext"
+    # plain binary for install.sh: dist/jancox-linux-x86_64
+    cp "target/$triple/release/$BIN$ext" "$DIST/$BIN-$name$ext"
 }
 
 # One zip per Linux/Windows architecture with the binary at the top and
@@ -241,7 +244,7 @@ main() {
     mkdir -p "$DIST"
     # a full build starts from an empty dist/; a partial one only replaces
     # its own zips
-    [[ " ${targets[*]} " == *" all "* ]] && rm -f "$DIST"/*.zip
+    [[ " ${targets[*]} " == *" all "* ]] && rm -f "$DIST"/*.zip "$DIST/$BIN"-*
     rm -f "$DIST"/SHA256SUMS
 
     select_targets "${targets[@]}"
@@ -282,8 +285,8 @@ main() {
         warn "Android module not packed: it needs all $android_all Android targets (./build.sh android)"
     fi
 
-    if compgen -G "$DIST/*.zip" >/dev/null; then
-        (cd "$DIST" && sha256sum *.zip >SHA256SUMS)
+    if compgen -G "$DIST/*.zip" >/dev/null || compgen -G "$DIST/$BIN-*" >/dev/null; then
+        (cd "$DIST" && shopt -s nullglob && sha256sum -- *.zip "$BIN"-* >SHA256SUMS)
     fi
 
     echo

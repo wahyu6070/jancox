@@ -6,7 +6,7 @@ members = ["crates/jancox-core", "crates/jancox-cli"]
 version = "3.0.0"
 edition = "2021"
 rust-version = "1.88"
-repository = "https://github.com/wahyu6070/Jancox-tool-android"
+repository = "https://github.com/wahyu6070/jancox"
 
 [workspace.dependencies]
 brotli = "9"
