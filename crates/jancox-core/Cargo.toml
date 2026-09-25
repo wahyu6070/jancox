@@ -1,0 +1,12 @@
+[package]
+name = "jancox-core"
+description = "Core library of Jancox tool: unpack/repack Android ROMs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+brotli.workspace = true
+img2sdat.workspace = true
+sdat2img.workspace = true

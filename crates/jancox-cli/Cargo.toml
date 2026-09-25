@@ -1,0 +1,14 @@
+[package]
+name = "jancox-cli"
+description = "Jancox tool command line: unpack/repack Android ROMs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "jancox"
+path = "src/main.rs"
+
+[dependencies]
+jancox-core.workspace = true
