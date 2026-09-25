@@ -239,7 +239,10 @@ main() {
 
     local entry name triple builder ok=() failed=()
     mkdir -p "$DIST"
-    rm -f "$DIST"/*.zip "$DIST"/SHA256SUMS
+    # a full build starts from an empty dist/; a partial one only replaces
+    # its own zips
+    [[ " ${targets[*]} " == *" all "* ]] && rm -f "$DIST"/*.zip
+    rm -f "$DIST"/SHA256SUMS
 
     select_targets "${targets[@]}"
     check_prereqs
