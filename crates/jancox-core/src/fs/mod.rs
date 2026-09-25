@@ -1,8 +1,11 @@
-//! Read-only access to Android filesystem images (ext4, later EROFS).
+//! Read-only access to Android filesystem images (ext4, EROFS), and image
+//! writers.
 
-use std::io::{self, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 
+pub mod erofs;
 pub mod ext4;
+pub mod mkerofs;
 pub mod mkext4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +65,54 @@ pub fn parse_capability(value: &[u8]) -> Option<u64> {
     // revision 2 and 3 carry a second 32-bit word
     let high = if value.len() >= 20 { u32_at(12) } else { 0 };
     Some(low | high << 32)
+}
+
+/// `len` bytes of `inner` starting at `start`, as a reader of its own
+/// (e.g. an image stored uncompressed inside a zip).
+pub struct Window<R> {
+    inner: R,
+    start: u64,
+    len: u64,
+    pos: u64,
+}
+
+impl<R: Seek> Window<R> {
+    pub fn new(mut inner: R, start: u64, len: u64) -> io::Result<Self> {
+        inner.seek(SeekFrom::Start(start))?;
+        Ok(Window {
+            inner,
+            start,
+            len,
+            pos: 0,
+        })
+    }
+}
+
+impl<R: Read + Seek> Read for Window<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let left = self.len.saturating_sub(self.pos);
+        let n = (buf.len() as u64).min(left) as usize;
+        if n == 0 {
+            return Ok(0);
+        }
+        let n = self.inner.read(&mut buf[..n])?;
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl<R: Read + Seek> Seek for Window<R> {
+    fn seek(&mut self, to: SeekFrom) -> io::Result<u64> {
+        let pos = match to {
+            SeekFrom::Start(p) => Some(p),
+            SeekFrom::End(d) => self.len.checked_add_signed(d),
+            SeekFrom::Current(d) => self.pos.checked_add_signed(d),
+        }
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "seek before start"))?;
+        self.inner.seek(SeekFrom::Start(self.start + pos))?;
+        self.pos = pos;
+        Ok(pos)
+    }
 }
 
 pub(crate) fn invalid(msg: impl Into<String>) -> io::Error {

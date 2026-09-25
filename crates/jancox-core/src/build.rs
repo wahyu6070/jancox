@@ -1,4 +1,5 @@
-//! Builds an ext4 image from a folder made by `extract` and its metadata:
+//! Builds an ext4 or EROFS image (the `fs_type` in `_info`) from a folder
+//! made by `extract` and its metadata:
 //!
 //! ```text
 //! <work>/<part>/                     files (added or removed files are picked up)
@@ -20,6 +21,7 @@ use std::path::Path;
 
 use crate::extract::{config_path, device_path, mount_point};
 use crate::fs::invalid;
+use crate::fs::mkerofs;
 use crate::fs::mkext4::{self, Node, NodeKind, Params};
 
 /// Android build timestamp (2009-01-01), used when `_info` has none.
@@ -445,11 +447,12 @@ pub fn build(
         }
     }
 
-    // lost+found: recorded by extract but not extracted
+    let erofs = info.get("fs_type").is_some_and(|t| t == "erofs");
+    // lost+found (ext4 only): recorded by extract but not extracted
     let NodeKind::Dir(children) = &mut root.kind else {
         unreachable!()
     };
-    if !children.iter().any(|c| c.name == b"lost+found") {
+    if !erofs && !children.iter().any(|c| c.name == b"lost+found") {
         let lf = w.node(
             b"lost+found".to_vec(),
             "lost+found",
@@ -467,9 +470,32 @@ pub fn build(
         .count();
     let mut sum = w.sum;
 
-    // image parameters
     let num = |k: &str| info.get(k).and_then(|v| v.parse::<u64>().ok());
     let bs = num("block_size").unwrap_or(4096);
+    if erofs {
+        // read-only: always just big enough, whatever `size` says
+        let params = mkerofs::Params {
+            block_size: bs,
+            uuid: parse_hex16(info.get("uuid")).unwrap_or_else(|| made_up_uuid(part)),
+            volume_name: info.get("volume_name").cloned().unwrap_or_default(),
+            timestamp: num("created").unwrap_or(DEFAULT_TIMESTAMP as u64),
+            timestamp_nsec: num("created_nsec").unwrap_or(0) as u32,
+        };
+        let (bytes, _) = mkerofs::image_size(&root, bs)?;
+        log(&format!(
+            "- Image: EROFS, {} blocks of {} bytes ({} MiB)",
+            bytes / bs,
+            bs,
+            bytes >> 20
+        ));
+        sum.block_size = bs;
+        sum.stats = mkerofs::write_image(output, &root, &params).inspect_err(|_| {
+            let _ = fs::remove_file(output);
+        })?;
+        return Ok(sum);
+    }
+
+    // ext4 image parameters
     let (data, used_inodes) = mkext4::data_blocks_needed(&root, bs)?;
     let auto_inodes = (used_inodes as u64 + used_inodes as u64 / 50 + 64) as u32;
     let (blocks, inodes) = match (size, num("blocks")) {

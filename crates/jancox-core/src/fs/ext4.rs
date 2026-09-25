@@ -104,7 +104,7 @@ fn cstr(b: &[u8]) -> String {
     String::from_utf8_lossy(&b[..end]).into_owned()
 }
 
-fn uuid(b: &[u8]) -> String {
+pub(crate) fn uuid(b: &[u8]) -> String {
     let h: Vec<String> = b.iter().map(|x| format!("{:02x}", x)).collect();
     format!(
         "{}-{}-{}-{}-{}",

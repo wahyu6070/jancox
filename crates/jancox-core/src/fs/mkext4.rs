@@ -220,8 +220,8 @@ fn dir_blocks(
     out
 }
 
-/// A security.* xattr: (name without prefix, value).
-fn xattrs(node: &Node) -> Vec<(&'static str, Vec<u8>)> {
+/// The security.* xattrs of a node: (name without prefix, value).
+pub(crate) fn security_xattrs(node: &Node) -> Vec<(&'static str, Vec<u8>)> {
     let mut v = Vec::new();
     if let Some(label) = &node.selinux {
         let mut value = label.as_bytes().to_vec();
@@ -919,7 +919,7 @@ fn finish_inode(
 
     // xattrs: in the inode when they fit, else one xattr block
     let mut sectors = data_blocks * (l.bs / 512);
-    let attrs = xattrs(node);
+    let attrs = security_xattrs(node);
     if !attrs.is_empty() {
         let area_start = 128 + EXTRA_ISIZE;
         put32(&mut b, area_start, XATTR_MAGIC);
@@ -978,7 +978,7 @@ pub fn data_blocks_needed(root: &Node, bs: u64) -> io::Result<(u64, u32)> {
             NodeKind::Symlink(t) if t.len() >= 60 => 1,
             NodeKind::Symlink(_) => 0,
         };
-        let attrs = xattrs(node);
+        let attrs = security_xattrs(node);
         let inline_room = INODE_SIZE as usize - 128 - EXTRA_ISIZE - 4;
         let need: usize = attrs
             .iter()

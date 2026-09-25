@@ -17,14 +17,14 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs::{self, File};
-use std::io::{self, BufWriter, Read, Write};
+use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+use crate::fs::erofs::{self, Erofs};
 use crate::fs::ext4::{self, Ext4};
 use crate::fs::{invalid, Filesystem, Kind, Meta};
 
 const SPARSE_MAGIC: u32 = 0xED26_FF3A;
-const EROFS_MAGIC: u32 = 0xE0F5_E1E2;
 
 #[derive(Debug, Default, Clone)]
 pub struct Summary {
@@ -56,31 +56,10 @@ pub fn extract(
     image: &Path,
     out_dir: &Path,
     part: Option<&str>,
-    mut log: impl FnMut(&str),
+    log: impl FnMut(&str),
 ) -> io::Result<Summary> {
-    let with_path =
-        |e: io::Error, p: &Path| io::Error::new(e.kind(), format!("{}: {}", p.display(), e));
-    let mut file = File::open(image).map_err(|e| with_path(e, image))?;
-    let mut head = vec![0u8; 2048];
-    let n = read_up_to(&mut file, &mut head)?;
-    head.truncate(n);
-
-    let magic = |off: usize| {
-        head.get(off..off + 4)
-            .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
-    };
-    if magic(0) == Some(SPARSE_MAGIC) {
-        return Err(invalid(
-            "this is an Android sparse image; convert it to a raw image first (simg2img)",
-        ));
-    }
-    if magic(1024) == Some(EROFS_MAGIC) {
-        return Err(invalid("EROFS images are not supported yet"));
-    }
-    if !ext4::is_ext4(&head) {
-        return Err(invalid("unknown filesystem (not ext4 or EROFS)"));
-    }
-
+    let file = File::open(image)
+        .map_err(|e| io::Error::new(e.kind(), format!("{}: {}", image.display(), e)))?;
     let part = match part {
         Some(p) => p.to_string(),
         None => image
@@ -88,8 +67,46 @@ pub fn extract(
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "system".into()),
     };
-    let mut fs = Ext4::open(file)?;
-    extract_fs(&mut fs, out_dir, &part, &mut log)
+    extract_reader(file, out_dir, &part, log)
+}
+
+/// Filesystem of an image from its first 2 KiB: "ext4", "erofs",
+/// "sparse" (Android sparse image) or `None`.
+pub fn detect(head: &[u8]) -> Option<&'static str> {
+    let magic = |off: usize| {
+        head.get(off..off + 4)
+            .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+    };
+    if magic(0) == Some(SPARSE_MAGIC) {
+        Some("sparse")
+    } else if erofs::is_erofs(head) {
+        Some("erofs")
+    } else if ext4::is_ext4(head) {
+        Some("ext4")
+    } else {
+        None
+    }
+}
+
+/// Extracts the ext4 or EROFS image read from `image` into `out_dir`.
+pub fn extract_reader<R: Read + Seek>(
+    mut image: R,
+    out_dir: &Path,
+    part: &str,
+    mut log: impl FnMut(&str),
+) -> io::Result<Summary> {
+    let mut head = vec![0u8; 2048];
+    image.seek(SeekFrom::Start(0))?;
+    let n = read_up_to(&mut image, &mut head)?;
+    head.truncate(n);
+    match detect(&head) {
+        Some("sparse") => Err(invalid(
+            "this is an Android sparse image; convert it to a raw image first (simg2img)",
+        )),
+        Some("erofs") => extract_fs(&mut Erofs::open(image)?, out_dir, part, &mut log),
+        Some("ext4") => extract_fs(&mut Ext4::open(image)?, out_dir, part, &mut log),
+        _ => Err(invalid("unknown filesystem (not ext4 or EROFS)")),
+    }
 }
 
 fn read_up_to(r: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
@@ -122,7 +139,12 @@ pub fn extract_fs<F: Filesystem>(
     part: &str,
     log: &mut impl FnMut(&str),
 ) -> io::Result<Summary> {
-    let mount = mount_point(&fs.volume_name(), part);
+    let volume = fs.volume_name();
+    let mount = if volume.trim().is_empty() && is_system_as_root(fs)? {
+        "/".to_string()
+    } else {
+        mount_point(&volume, part)
+    };
     let root_dir = out_dir.join(part);
     if root_dir.exists() && fs::read_dir(&root_dir)?.next().is_some() {
         return Err(io::Error::new(
@@ -182,6 +204,19 @@ pub fn extract_fs<F: Filesystem>(
     }
     fs::write(config_dir.join(format!("{}_info", part)), text)?;
     Ok(sum)
+}
+
+/// True when the image root holds `system/build.prop`: a system-as-root
+/// image, mounted at "/". EROFS images have no volume name to say so.
+fn is_system_as_root<F: Filesystem>(fs: &mut F) -> io::Result<bool> {
+    let root = fs.root();
+    let Some((_, system)) = fs.read_dir(root)?.into_iter().find(|(n, _)| n == b"system") else {
+        return Ok(false);
+    };
+    if fs.meta(system)?.kind != Kind::Dir {
+        return Ok(false);
+    }
+    Ok(fs.read_dir(system)?.iter().any(|(n, _)| n == b"build.prop"))
 }
 
 type Stack<N> = Vec<(Vec<u8>, N)>;

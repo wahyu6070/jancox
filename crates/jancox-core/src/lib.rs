@@ -4,6 +4,7 @@ pub mod br;
 pub mod build;
 pub mod dat;
 pub mod extract;
+pub mod factory;
 pub mod fs;
 pub mod rom;
 pub mod sdat;

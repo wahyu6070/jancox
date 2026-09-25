@@ -1,4 +1,9 @@
 # changelog
+## Unreleased
+- EROFS: own extractor (uncompressed images: flat, inline tail and chunk-based files, shared/inline xattrs) and image builder; partitions are rebuilt with the filesystem they came with
+- Fastboot ROMs: Pixel factory images (`<device>-<build>/image-*.zip`) and plain `image-*.zip` unpack and repack. The logical partitions from `super_empty.img` are read straight out of the zip; repack checks the super group size and disables dm-verity/verification in `vbmeta.img`
+- Recovery ROMs with uncompressed EROFS inside `*.new.dat.br` work too. Compressed EROFS (lz4/lzma, used by most non-Pixel ROMs) is not supported yet
+
 ## 3.0.0 25-09-2026
 - Rewritten in Rust: one `jancox` binary for Android, Linux and Windows; no Python, busybox or Termux packages, no root needed
 - New commands: unpack, repack, cleanup, extract, build, sdat2img, img2sdat, brotli

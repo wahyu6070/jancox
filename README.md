@@ -4,8 +4,11 @@ Unpack and repack Android ROM zips on Android, Linux and Windows.
 
 Jancox is one `jancox` binary, written in Rust, with no dependencies. Unpacking and repacking need no root.
 
-- Unpack a flashable ROM zip (`*.new.dat.br` / `*.new.dat` + `*.transfer.list`) into folders you can edit.
-- Repack the folders into a new flashable ROM zip.
+- Unpack a ROM zip into folders you can edit:
+  - recovery ROMs (`*.new.dat.br` / `*.new.dat` + `*.transfer.list`)
+  - fastboot ROMs such as Pixel factory images (`<device>-<build>/image-*.zip`, flashed with `flash-all.sh`), or an `image-*.zip` on its own
+- ext4 and EROFS partitions.
+- Repack the folders into a new ROM zip of the same kind.
 - Keeps owners, permissions, SELinux labels and capabilities in metadata files, so it works on `/sdcard` and on Windows too.
 - Grows full dynamic partitions and updates `dynamic_partitions_op_list`.
 
@@ -97,6 +100,14 @@ partition/config/<part>_info         filesystem parameters (size, UUID, ...)
 - Deleted files are left out of the new image.
 - Where the storage can't hold symlinks (`/sdcard`, Windows), `unpack` says so, and symlinks live only in `partition/config/<part>_symlinks`; `repack` puts them back. Remove a line there to delete a symlink. Working in a folder with symlink support (e.g. the Termux home `~`) shows them as real symlinks.
 
+### Fastboot ROMs (Pixel factory images)
+
+Put the factory zip (e.g. `cubs-cd1a.260905.001.b1-factory-3bd92fff.zip` from [developers.google.com/android/images](https://developers.google.com/android/images)) in `input/` and run `jancox unpack` as usual.
+
+- The logical partitions listed in `super_empty.img` (system, system_ext, product, vendor, system_dlkm, vendor_dlkm) go to `partition/`. They are read straight from the zip, so no temporary images are written.
+- Everything else goes to `rom/<device>-<build>/`, and the files of `image-*.zip` go to `rom/<device>-<build>/image-<device>-<build>/`. Firmware images such as modem, radio and bootloader, plus `system_other.img`, are kept as they are.
+- `jancox repack` rebuilds each partition with its original filesystem (EROFS on Pixels). It checks that they fit the super partition group, sets the disable-verity flags in `vbmeta.img`, and writes `output/NewROM-<date>.zip` with the same layout. Flash it with `flash-all.sh` / `flash-all.bat` on an unlocked device.
+
 ### Commands
 
 ```
@@ -105,8 +116,8 @@ jancox unpack   [rom.zip] [-w workdir]
 jancox repack   [-w workdir] [-o out.zip] [-b brotli_quality] [-z zip_level]
 jancox cleanup  [-w workdir] [--all]
 
-jancox extract  <image> [-o outdir] [-p name]           ext4 image -> folder + metadata
-jancox build    <workdir> <part> [-o image] [-s size|auto]  folder + metadata -> ext4 image
+jancox extract  <image> [-o outdir] [-p name]           ext4/EROFS image -> folder + metadata
+jancox build    <workdir> <part> [-o image] [-s size|auto]  folder + metadata -> ext4/EROFS image
 jancox sdat2img <transfer_list> <new_dat[.br]> [image]
 jancox img2sdat <image> [-o outdir] [-v version] [-p prefix] [-b quality]
 jancox brotli   [-d] [-q quality] [-w window] [-o output] <file>
@@ -116,9 +127,9 @@ jancox brotli   [-d] [-q quality] [-w window] [-o output] <file>
 
 ## Limitations
 
-- Only ext4 partitions. EROFS ROMs are not supported yet.
-- `payload.bin` ROMs (A/B OTA zips) are not supported yet.
-- A repacked partition no longer matches its dm-verity hashtree / AVB data, so the ROM only boots with verification disabled (as with older Jancox versions).
+- EROFS images with compressed files (lz4, lzma, ...) can't be read yet; uncompressed EROFS (as in Pixel factory images) works.
+- `payload.bin` ROMs (A/B OTA zips) and `super.img` are not supported yet.
+- A repacked partition no longer matches its dm-verity hashtree / AVB data, so the ROM only boots with verification disabled (as with older Jancox versions). For fastboot ROMs, repack sets the "disable verity + verification" flags in `vbmeta.img`; this needs an unlocked bootloader, and the first flash with these flags needs a data wipe (`flash-all.sh` wipes by default).
 - Paths with spaces can't be stored in `fs_config` and get a warning.
 - Hard links become separate files.
 

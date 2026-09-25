@@ -46,10 +46,11 @@ fn usage() {
         br::DEFAULT_LGWIN
     );
     out!("  extract <image> [-o outdir] [-p name]");
-    out!("      Extract an ext4 image to <outdir>/<name>/ plus metadata in <outdir>/config/");
+    out!("      Extract an ext4 or EROFS image to <outdir>/<name>/ plus metadata in <outdir>/config/");
     out!("      (default: -o . -p <image name>)");
     out!("  build <workdir> <part> [-o image] [-s size|auto] [-f]");
-    out!("      Build an ext4 image from <workdir>/<part>/ and <workdir>/config/<part>_*");
+    out!("      Build an ext4 or EROFS image (fs_type in <part>_info) from <workdir>/<part>/");
+    out!("      and <workdir>/config/<part>_*");
     out!("      (default: -o <workdir>/<part>.img, -s = original size; size in bytes or K/M/G)");
     out!("  help     Show this help");
     out!("  version  Show version");
