@@ -20,11 +20,49 @@ Uncompressed EROFS is read (`fs/erofs.rs`) and written (`fs/mkerofs.rs`), and wa
 
 A/B OTA zips (`payload.bin` + `payload_properties.txt`). Unpack is refused for now.
 
-- Parse the payload header and the `DeltaArchiveManifest` protobuf (hand-written decoder, no protobuf crate).
-- Full OTAs only: REPLACE, REPLACE_BZ, REPLACE_XZ, ZERO, DISCARD operations. Needs bzip2 and xz decoders (pure Rust crates or our own).
-- Incremental OTAs (SOURCE_COPY, SOURCE_BSDIFF, PUFFDIFF, BROTLI_BSDIFF, ZUCCHINI) need the old images: out of scope.
-- Extract every partition image; ext4/EROFS ones go through `extract.rs`, the rest (boot, vbmeta, ...) to `rom/`.
-- Repack: write a new full payload (REPLACE_XZ or REPLACE, SHA-256 per operation and per partition) and sign it with test keys? Or repack into a fastboot ROM (images + `super_empty.img`) instead, which needs no signing.
+Do compressed EROFS (lz4/lz4hc) first: most payload ROMs (Xiaomi, OnePlus, ...) ship lz4 EROFS, so without it the dumped images can't be extracted.
+
+### Unpack
+
+- Read `payload.bin` straight from the zip (it is stored) with `factory::stored_range` + `fs::Window`.
+- Parse the header (`CrAU`, version 2, manifest size, metadata signature size) and the `DeltaArchiveManifest` protobuf with a small hand-written decoder (no prost/protoc).
+- Full OTAs only: REPLACE, REPLACE_XZ, REPLACE_BZ, ZSTD, ZERO, DISCARD. Check `data_sha256_hash` per operation and `new_partition_info.hash` per partition (SHA-256). Operations are independent: decode them in parallel with `std::thread::scope`.
+- Incremental OTAs (SOURCE_COPY, SOURCE_BSDIFF, BROTLI_BSDIFF, PUFFDIFF, ZUCCHINI, LZ4DIFF_*) need the old images: refuse them.
+- ext4/EROFS partitions go through `extract.rs`. The rest (boot, vendor_boot, vbmeta, firmware, ...) go to `rom/` as images.
+- Pure-Rust decoders that cross-compile for Android: xz (`lzma-rs` or our own), bzip2 (`bzip2` with the Rust backend), zstd (`ruzstd`), and `sha2`.
+
+### Repack, in this order
+
+1. **Fastboot ROM** (no signing, most code exists): rebuilt images + untouched images + a `super_empty.img` made from the manifest's `dynamic_partition_metadata` (groups, max sizes, partitions) + `flash-all.sh`/`.bat`. Reuses `mkerofs`, `factory::check_groups` and the vbmeta patch.
+2. **super.img** (see below): the same images in one lpmake-like `super.img`.
+3. **New payload.bin** (flashable in recovery):
+   - Manifest via a hand-written protobuf encoder: `block_size`, `minor_version = 0` (full), `dynamic_partition_metadata`, and per partition `new_partition_info` (size + SHA-256) and its operations.
+   - Rebuilt partitions: 2 MiB chunks as REPLACE_XZ, falling back to REPLACE when xz doesn't shrink the chunk (as `full_update_generator.cc` does). ZSTD is faster but only newer `update_engine` versions read it. A pure-Rust xz encoder compresses worse; `liblzma` (C) is better but must cross-compile.
+   - Untouched partitions: copy their operations and data blobs from the old payload as they are (no recompression).
+   - `vbmeta.img` in the payload: set the disable-verity/verification flags (as for fastboot ROMs).
+   - `payload_properties.txt` (`FILE_HASH`, `FILE_SIZE`, `METADATA_HASH`, `METADATA_SIZE`, base64 SHA-256) and `META-INF/com/android/metadata` + `metadata.pb`.
+   - Signing: RSA-2048 PKCS#1 v1.5 + SHA-256 over the metadata and the whole payload, plus the zip signature, with the AOSP test keys (own code or the `rsa` crate). Stock recoveries reject it (OEM keys). Custom recoveries (TWRP, OrangeFox, LineageOS recovery) take test keys, skip the check, or ask "install anyway".
+   - Test: AOSP `scripts/update_payload/checker.py` must accept our payload. Compare with `delta_generator` from `otatools.zip` (Linux x86_64 only, so as a reference, not a dependency).
+
+### References
+
+AOSP (Apache-2.0), easiest to browse on cs.android.com:
+
+- [platform/system/update_engine](https://android.googlesource.com/platform/system/update_engine/):
+  - `update_metadata.proto`: the manifest format.
+  - `payload_generator/`: `delta_generator`. `generate_delta_main.cc` (options), `full_update_generator.cc` (full OTA chunks), `payload_file.cc` (writes `payload.bin`), `payload_signer.cc` (hashes, signatures, `METADATA_HASH`/`FILE_HASH`), `xz_android.cc`, `extent_utils.cc`.
+  - `scripts/brillo_update_payload`: the steps `generate`, `hash`, `sign`, `properties`. The clearest map of a repack.
+  - `scripts/update_payload/`: Python payload reader and `checker.py`, to validate ours.
+- [platform/build tools/releasetools](https://android.googlesource.com/platform/build/+/refs/heads/main/tools/releasetools/): `ota_from_target_files.py` (the A/B OTA zip: payload, `payload_properties.txt`, `META-INF/com/android/metadata(.pb)`, `care_map.pb`, zip signing), `ota_utils.py`, `ota_metadata.proto`, `payload_signer.py`. Test keys: `build/make/target/product/security/testkey.{pk8,x509.pem}`.
+- [platform/bootable/recovery](https://android.googlesource.com/platform/bootable/recovery/): `install/install.cpp` (zip signature against `otacerts.zip`, then `payload_properties.txt` -> `update_engine`). Shows which checks a custom recovery can skip.
+
+[rhythmcache/payload-dumper-rust](https://github.com/rhythmcache/payload-dumper-rust) (Apache-2.0; checked at `ac244d8`, 2026-09-05): a dumper only (no repack). Borrow its knowledge, not its stack:
+
+- `src/payload/payload_parser.rs`: header and where the data blob starts.
+- `src/payload/payload_dumper.rs`: one operation -> `dst_extents` (REPLACE, REPLACE_XZ, REPLACE_BZ, ZSTD, ZERO) with the hash check.
+- `src/zip/core_parser.rs` + `src/readers/local_zip_reader.rs`: `payload.bin` read inside the zip (we have `factory::stored_range` + `fs::Window`).
+- `src/payload/diff.rs`: incremental ops, only if they ever matter.
+- Don't take its dependencies (tokio/async, prost + `build.rs` codegen, reqwest, clap, indicatif). Keep the Apache-2.0 notice on anything copied almost verbatim.
 
 ## super.img
 
