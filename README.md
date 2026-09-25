@@ -11,13 +11,35 @@ Version 3 is a rewrite in Rust: one `jancox` binary with no dependencies. It nee
 
 ## Install
 
-**Linux (Ubuntu, Debian, ...) and Termux**: one line, installs `jancox` into `/usr/local/bin` (Linux, asks for sudo) or `$PREFIX/bin` (Termux):
+### Android (root: Magisk, KernelSU, APatch)
+
+1. Download `Jancox-tool-android-v<version>.zip` from [Releases](https://github.com/wahyu6070/jancox/releases).
+2. Install it as a module in the Magisk / KernelSU / APatch app (or flash it in recovery), then reboot.
+3. Open a terminal app (e.g. Termux) and run `jancox --help`.
+
+The module installs `jancox` for your CPU into `/system/bin`, and also into Termux when Termux is installed.
+
+### Termux (no root)
 
 ```sh
+pkg install curl
 curl -fsSL https://raw.githubusercontent.com/wahyu6070/jancox/master/install.sh | sh
 ```
 
-It picks the binary for your CPU and checks its SHA256. Options go after `sh -s --`:
+`jancox` goes into `$PREFIX/bin`. To work on files in your internal storage, run `termux-setup-storage` once. The Termux home (`~`) is faster than `/sdcard` and keeps symlinks.
+
+### Ubuntu / Debian
+
+```sh
+sudo apt install curl
+curl -fsSL https://raw.githubusercontent.com/wahyu6070/jancox/master/install.sh | sh
+```
+
+`jancox` goes into `/usr/local/bin` (the script asks for your sudo password). It is a static binary, so it has no other dependencies.
+
+### Other Linux
+
+The same one line works on any Linux with `curl` (or `wget`) and `sh`. Without sudo it installs into `~/.local/bin`. Options go after `sh -s --`:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/wahyu6070/jancox/master/install.sh | sh -s -- --version v3.0.0
@@ -25,9 +47,15 @@ curl -fsSL https://raw.githubusercontent.com/wahyu6070/jancox/master/install.sh 
 curl -fsSL https://raw.githubusercontent.com/wahyu6070/jancox/master/install.sh | sh -s -- --uninstall
 ```
 
-**Android with root**: flash `Jancox-tool-android-v<version>.zip` in Magisk (or KernelSU / APatch / recovery).
+You can also download `Jancox-tool-linux-<arch>-v<version>.zip`, extract it and run `./jancox` in that folder.
 
-**Windows**: download the zip below, extract it, and run `jancox.exe` from cmd or PowerShell in that folder.
+### Windows
+
+1. Download `Jancox-tool-windows-x86_64-v<version>.zip` (`arm64` for ARM PCs) from [Releases](https://github.com/wahyu6070/jancox/releases).
+2. Extract it to a folder you can write to, e.g. `D:\jancox` (not `C:\Program Files`).
+3. Open cmd or PowerShell in that folder and run `jancox --help`. It doesn't need administrator rights.
+
+If SmartScreen says "Windows protected your PC", click **More info → Run anyway** (the binary isn't signed). You can also right-click the zip → Properties → **Unblock** before extracting it.
 
 ## Download
 
