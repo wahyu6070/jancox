@@ -7,6 +7,7 @@ Jancox is one `jancox` binary, written in Rust, with no dependencies. Unpacking 
 - Unpack a ROM zip into folders you can edit:
   - recovery ROMs (`*.new.dat.br` / `*.new.dat` + `*.transfer.list`)
   - fastboot ROMs such as Pixel factory images (`<device>-<build>/image-*.zip`, flashed with `flash-all.sh`), or an `image-*.zip` on its own
+  - A/B OTA zips with `payload.bin` (full OTAs; unpack only for now)
 - ext4 and EROFS partitions.
 - Repack the folders into a new ROM zip of the same kind.
 - Keeps owners, permissions, SELinux labels and capabilities in metadata files, so it works on `/sdcard` and on Windows too.
@@ -108,6 +109,17 @@ Put the factory zip (e.g. `cubs-cd1a.260905.001.b1-factory-3bd92fff.zip` from [d
 - Everything else goes to `rom/<device>-<build>/`, and the files of `image-*.zip` go to `rom/<device>-<build>/image-<device>-<build>/`. Firmware images such as modem, radio and bootloader, plus `system_other.img`, are kept as they are.
 - `jancox repack` rebuilds each partition with its original filesystem (EROFS on Pixels). It checks that they fit the super partition group, sets the disable-verity flags in `vbmeta.img`, and writes `output/NewROM-<date>.zip` with the same layout. Flash it with `flash-all.sh` / `flash-all.bat` on an unlocked device.
 
+### payload.bin ROMs (A/B OTA zips)
+
+Full OTA zips with a `payload.bin` (e.g. ASUS, Xiaomi, OnePlus stock ROMs) unpack with `jancox unpack` as usual. Incremental OTAs are refused.
+
+- The logical partitions (system, system_ext, product, vendor, odm, ...) go to `partition/`.
+- The other images (boot, vendor_boot, dtbo, vbmeta, modem, bootloader, ...) go to `rom/payload/<name>.img`.
+- Every image is checked against the SHA-256 in the payload.
+- `repack` does not support these ROMs yet.
+
+`jancox payload ota.zip -o images/` only dumps the images (like payload-dumper); `-p boot,vendor_boot` picks some, `-l` lists them.
+
 ### Commands
 
 ```
@@ -117,6 +129,7 @@ jancox repack   [-w workdir] [-o out.zip] [-b brotli_quality] [-z zip_level]
 jancox cleanup  [-w workdir] [--all]
 
 jancox extract  <image> [-o outdir] [-p name]           ext4/EROFS image -> folder + metadata
+jancox payload  <payload.bin|ota.zip> [-o outdir] [-p name,...] [-l]  payload -> images
 jancox build    <workdir> <part> [-o image] [-s size|auto]  folder + metadata -> ext4/EROFS image
 jancox sdat2img <transfer_list> <new_dat[.br]> [image]
 jancox img2sdat <image> [-o outdir] [-v version] [-p prefix] [-b quality]
@@ -128,7 +141,7 @@ jancox brotli   [-d] [-q quality] [-w window] [-o output] <file>
 ## Limitations
 
 - EROFS images with compressed files (lz4, lzma, ...) can't be read yet; uncompressed EROFS (as in Pixel factory images) works.
-- `payload.bin` ROMs (A/B OTA zips) and `super.img` are not supported yet.
+- `payload.bin` ROMs unpack, but don't repack yet; incremental OTAs are refused. `super.img` is not supported yet.
 - A repacked partition no longer matches its dm-verity hashtree / AVB data, so the ROM only boots with verification disabled (as with older Jancox versions). For fastboot ROMs, repack sets the "disable verity + verification" flags in `vbmeta.img`; this needs an unlocked bootloader, and the first flash with these flags needs a data wipe (`flash-all.sh` wipes by default).
 - Paths with spaces can't be stored in `fs_config` and get a warning.
 - Hard links become separate files.

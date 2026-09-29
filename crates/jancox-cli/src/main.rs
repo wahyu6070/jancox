@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process;
 use std::time::Instant;
 
-use jancox_core::{br, build, dat, extract, img2sdat, rom, sdat};
+use jancox_core::{br, build, dat, extract, img2sdat, payload, rom, sdat};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -48,6 +48,9 @@ fn usage() {
     out!("  extract <image> [-o outdir] [-p name]");
     out!("      Extract an ext4 or EROFS image to <outdir>/<name>/ plus metadata in <outdir>/config/");
     out!("      (default: -o . -p <image name>)");
+    out!("  payload <payload.bin|ota.zip> [-o outdir] [-p name,...] [-l] [-t threads]");
+    out!("      Dump the partition images of a full A/B OTA payload to <outdir>/<name>.img");
+    out!("      (default: -o . and all partitions; -l only lists them)");
     out!("  build <workdir> <part> [-o image] [-s size|auto] [-f]");
     out!("      Build an ext4 or EROFS image (fs_type in <part>_info) from <workdir>/<part>/");
     out!("      and <workdir>/config/<part>_*");
@@ -249,6 +252,85 @@ fn extract(args: &[String]) -> Result<(), String> {
         out_dir.display(),
         sum.part
     );
+    Ok(())
+}
+
+fn payload(args: &[String]) -> Result<(), String> {
+    const USAGE: &str =
+        "usage: jancox payload <payload.bin|ota.zip> [-o outdir] [-p name,...] [-l] [-t threads]";
+    let (mut input, mut out_dir, mut names, mut list) = (None, PathBuf::from("."), None, false);
+    let mut threads = payload::default_threads();
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        let mut value = || {
+            it.next()
+                .cloned()
+                .ok_or_else(|| format!("{} needs a value\n{}", arg, USAGE))
+        };
+        match arg.as_str() {
+            "-o" | "--outdir" => out_dir = PathBuf::from(value()?),
+            "-p" | "--part" => {
+                names = Some(value()?.split(',').map(str::to_string).collect::<Vec<_>>())
+            }
+            "-l" | "--list" => list = true,
+            "-t" | "--threads" => {
+                threads = value()?
+                    .parse()
+                    .map_err(|_| format!("bad thread count\n{}", USAGE))?
+            }
+            _ if input.is_none() && !arg.starts_with('-') => input = Some(PathBuf::from(arg)),
+            _ => return Err(format!("unexpected argument: {}\n{}", arg, USAGE)),
+        }
+    }
+    let input = input.ok_or(USAGE)?;
+    let fail = |e: io::Error| format!("payload failed: {}", e);
+    let (mut reader, info) = payload::open(&input).map_err(fail)?;
+    let m = &info.manifest;
+    if list {
+        for p in &m.partitions {
+            out!(
+                "{:<20} {:>12} bytes  {} operations",
+                p.name,
+                p.size,
+                p.ops.len()
+            );
+        }
+        for g in &m.groups {
+            out!(
+                "- group {} ({} bytes): {}",
+                g.name,
+                g.max_size,
+                g.partitions.join(" ")
+            );
+        }
+        return Ok(());
+    }
+    m.check_full().map_err(fail)?;
+    let parts: Vec<&payload::PartitionUpdate> = match &names {
+        None => m.partitions.iter().collect(),
+        Some(names) => names
+            .iter()
+            .map(|n| {
+                m.partition(n)
+                    .ok_or_else(|| format!("no partition {} in the payload", n))
+            })
+            .collect::<Result<_, _>>()?,
+    };
+    fs::create_dir_all(&out_dir).map_err(|e| format!("{}: {}", out_dir.display(), e))?;
+    let start = Instant::now();
+    for p in parts {
+        let path = out_dir.join(format!("{}.img", p.name));
+        out!("- {}: {} MiB -> {}", p.name, p.size >> 20, path.display());
+        let mut file = fs::File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .map_err(|e| format!("{}: {}", path.display(), e))?;
+        payload::dump_partition(&mut reader, &info, p, &mut file, threads).map_err(fail)?;
+    }
+    out!("- Done in {:.1}s", start.elapsed().as_secs_f64());
     Ok(())
 }
 
@@ -470,6 +552,7 @@ fn main() {
         Some("brotli") => brotli(&args[1..]),
         Some("extract") => extract(&args[1..]),
         Some("build") => build(&args[1..]),
+        Some("payload") => payload(&args[1..]),
         Some("-V" | "--version" | "version") => {
             out!("jancox {}", VERSION);
             Ok(())

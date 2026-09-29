@@ -2,6 +2,8 @@
 ## Unreleased
 - EROFS: own extractor (uncompressed images: flat, inline tail and chunk-based files, shared/inline xattrs) and image builder; partitions are rebuilt with the filesystem they came with
 - Fastboot ROMs: Pixel factory images (`<device>-<build>/image-*.zip`) and plain `image-*.zip` unpack and repack. The logical partitions from `super_empty.img` are read straight out of the zip; repack checks the super group size and disables dm-verity/verification in `vbmeta.img`
+- payload.bin ROMs (A/B OTA zips, full OTAs): unpack dumps the images straight from the zip (REPLACE, REPLACE_XZ, REPLACE_BZ, ZSTD, ZERO; decoded in parallel, SHA-256 checked) and extracts the logical partitions; the other images go to `rom/payload/`. Repack is not supported yet
+- New command: `jancox payload` dumps the images of a payload.bin or OTA zip
 - Recovery ROMs with uncompressed EROFS inside `*.new.dat.br` work too. Compressed EROFS (lz4/lzma, used by most non-Pixel ROMs) is not supported yet
 
 ## 3.0.0 25-09-2026

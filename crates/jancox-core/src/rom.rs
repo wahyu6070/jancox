@@ -18,6 +18,9 @@
 //! - fastboot ROMs such as Pixel factory images (see factory.rs): raw
 //!   images inside `image-*.zip`, read straight out of the zip. The rest of
 //!   the inner zip goes to `rom/<image zip without .zip>/`.
+//! - A/B OTA zips with a `payload.bin` (see payload.rs), full OTAs only.
+//!   The logical partitions are dumped and extracted, the other images
+//!   (boot, vendor_boot, vbmeta, firmware) go to `rom/payload/<name>.img`.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -29,7 +32,7 @@ use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 use crate::build::{self, Size};
 use crate::fs::invalid;
-use crate::{br, extract, factory, sdat};
+use crate::{br, extract, factory, payload, sdat};
 
 const STATE: &str = "jancox_rom";
 const OP_LIST: &str = "dynamic_partitions_op_list";
@@ -72,6 +75,8 @@ pub enum Format {
     Sdat,
     /// raw images in a fastboot `image-*.zip`
     Fastboot,
+    /// A/B OTA `payload.bin`
+    Payload,
 }
 
 /// What unpack found, for repack.
@@ -81,6 +86,7 @@ pub struct State {
     pub partitions: Vec<Partition>,
     /// Fastboot ROMs: the image zip in the ROM zip (empty when the ROM is
     /// the image zip itself), and its entries in their original order.
+    /// Payload ROMs: the entries of the ROM zip in their original order.
     pub image_zip: String,
     pub image_entries: Vec<String>,
 }
@@ -99,9 +105,10 @@ fn write_state(work: &Path, input: &Path, state: &State) -> io::Result<()> {
     let format = match state.format {
         Format::Sdat => "sdat",
         Format::Fastboot => "fastboot",
+        Format::Payload => "payload",
     };
     s.push_str(&format!("format={}\n", format));
-    if state.format == Format::Fastboot {
+    if state.format != Format::Sdat {
         s.push_str(&format!("image_zip={}\n", state.image_zip));
         s.push_str(&format!(
             "image_entries={}\n",
@@ -160,6 +167,7 @@ pub fn read_full_state(work: &Path) -> io::Result<Option<State>> {
     let format = match kv.get("format").copied() {
         None | Some("sdat") => Format::Sdat,
         Some("fastboot") => Format::Fastboot,
+        Some("payload") => Format::Payload,
         Some(f) => return Err(invalid(format!("{}: unknown format {}", STATE, f))),
     };
     Ok(Some(State {
@@ -284,15 +292,13 @@ pub fn unpack(input: &Path, work: &Path, mut log: impl FnMut(&str)) -> io::Resul
         .map_err(|e| io::Error::new(e.kind(), format!("{}: {}", input.display(), e)))?;
     let mut zip = ZipArchive::new(BufReader::new(file)).map_err(zip_err)?;
     let names: Vec<String> = zip.file_names().map(str::to_string).collect();
-    if names.iter().any(|n| n == "payload.bin") {
-        return Err(invalid("payload.bin ROMs are not supported yet"));
-    }
+    let has_payload = names.iter().any(|n| n == payload::ENTRY);
     let has_sdat = names.iter().any(|n| n.ends_with(".transfer.list"));
     let image_zip = factory::find_image_zip(names.iter().map(String::as_str)).map(str::to_string);
     let is_image_zip = factory::is_image_zip(names.iter().map(String::as_str));
-    if !has_sdat && image_zip.is_none() && !is_image_zip {
+    if !has_payload && !has_sdat && image_zip.is_none() && !is_image_zip {
         return Err(invalid(
-            "no *.transfer.list + *.new.dat[.br] partitions and no fastboot image-*.zip in this zip",
+            "no payload.bin, no *.transfer.list + *.new.dat[.br] partitions and no fastboot image-*.zip in this zip",
         ));
     }
     log(&format!("- ROM: {}", input.display()));
@@ -302,7 +308,9 @@ pub fn unpack(input: &Path, work: &Path, mut log: impl FnMut(&str)) -> io::Resul
         log("    Symlinks are kept in config/<part>_symlinks and put back on repack.");
         log("    To see them as real symlinks, work in a folder like the Termux home (~).");
     }
-    let (state, other_files) = if has_sdat {
+    let (state, other_files) = if has_payload {
+        unpack_payload(input, &mut zip, &names, work, &mut log)?
+    } else if has_sdat {
         unpack_sdat(&mut zip, &names, work, &mut log)?
     } else {
         unpack_fastboot(input, &mut zip, image_zip, work, &mut log)?
@@ -607,6 +615,148 @@ fn unpack_fastboot<R: Read + Seek>(
     Ok((state, other_files + others))
 }
 
+/// Folder under `rom/` for the images of a payload.bin that are not
+/// extracted.
+const PAYLOAD_IMAGES: &str = "payload";
+
+/// Partitions extracted from a payload without dynamic partitions.
+const PAYLOAD_FS_PARTS: &[&str] = &[
+    "system",
+    "system_ext",
+    "product",
+    "vendor",
+    "odm",
+    "system_dlkm",
+    "vendor_dlkm",
+    "odm_dlkm",
+];
+
+fn unpack_payload<R: Read + Seek>(
+    input: &Path,
+    zip: &mut ZipArchive<R>,
+    names: &[String],
+    work: &Path,
+    log: &mut impl FnMut(&str),
+) -> io::Result<(State, usize)> {
+    let index = zip
+        .index_for_name(payload::ENTRY)
+        .ok_or_else(|| invalid("payload.bin not found"))?;
+    let (start, len) = factory::stored_range(zip, index)?.ok_or_else(|| {
+        invalid("payload.bin is compressed inside the ROM zip; extract it and zip it stored")
+    })?;
+    let mut reader = factory::open_window(input, start, len)?;
+    let info = payload::Payload::read(&mut reader)?;
+    let m = &info.manifest;
+    m.check_full()?;
+    if info.data_offset > len {
+        return Err(invalid("payload.bin: truncated"));
+    }
+    log(&format!(
+        "- payload.bin: {} partitions, {} MiB",
+        m.partitions.len(),
+        len >> 20
+    ));
+
+    let rom_dir = work.join("rom");
+    let other_files = extract_entries(zip, &rom_dir, |n| n != payload::ENTRY, log)?;
+    log(&format!(
+        "- Extracted {} other files to {}",
+        other_files,
+        rom_dir.display()
+    ));
+
+    // logical partitions with ext4 / EROFS are extracted, the rest are kept
+    // as images
+    let logical: Vec<&str> = if m.groups.is_empty() {
+        PAYLOAD_FS_PARTS.to_vec()
+    } else {
+        m.groups
+            .iter()
+            .flat_map(|g| &g.partitions)
+            .map(|p| factory::strip_slot(p))
+            .collect()
+    };
+    let images = rom_dir.join(PAYLOAD_IMAGES);
+    let tmp = work.join("tmp");
+    fs::create_dir_all(&images)?;
+    fs::create_dir_all(&tmp)?;
+    let threads = payload::default_threads();
+    let mut parts = Vec::new();
+    let mut kept = Vec::new();
+    for p in &m.partitions {
+        let file_name = format!("{}.img", p.name);
+        let extract = logical.contains(&p.name.as_str());
+        let path = if extract {
+            tmp.join(&file_name)
+        } else {
+            images.join(&file_name)
+        };
+        if extract {
+            log(&format!(
+                "- {}: payload -> image, {} MiB",
+                p.name,
+                p.size >> 20
+            ));
+        }
+        let mut file = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)?;
+        payload::dump_partition(&mut reader, &info, p, &mut file, threads)?;
+        if !extract {
+            kept.push(p.name.as_str());
+            continue;
+        }
+        let mut head = vec![0u8; 2048];
+        file.seek(io::SeekFrom::Start(0))?;
+        let n = read_up_to(&mut file, &mut head)?;
+        let fs_type = match extract::detect(&head[..n]) {
+            Some(t @ ("ext4" | "erofs")) => t,
+            _ => {
+                drop(file);
+                fs::rename(&path, images.join(&file_name))?;
+                kept.push(p.name.as_str());
+                continue;
+            }
+        };
+        log(&format!("- {}: {} image", p.name, fs_type));
+        let sum = extract::extract_reader(
+            BufReader::with_capacity(1 << 16, file),
+            &partition_dir(work),
+            &p.name,
+            &mut *log,
+        )?;
+        log_extracted(&sum, log);
+        fs::remove_file(&path)?;
+        parts.push(Partition {
+            name: p.name.clone(),
+            version: 0,
+            brotli: false,
+            size: p.size,
+            fs: fs_type.to_string(),
+        });
+    }
+    let _ = fs::remove_dir(&tmp);
+    log(&format!(
+        "- {} images to {}: {}",
+        kept.len(),
+        images.display(),
+        kept.join(" ")
+    ));
+    if parts.is_empty() {
+        return Err(invalid("no ext4 or EROFS partitions in payload.bin"));
+    }
+    let state = State {
+        format: Format::Payload,
+        partitions: parts,
+        image_zip: String::new(),
+        image_entries: names.to_vec(),
+    };
+    Ok((state, other_files + kept.len()))
+}
+
 fn read_up_to(r: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
     let mut n = 0;
     while n < buf.len() {
@@ -754,6 +904,7 @@ pub fn repack(
     let result = match state.format {
         Format::Sdat => repack_sdat(work, &state.partitions, &partial, &tmp, opts, &mut log),
         Format::Fastboot => repack_fastboot(work, &state, &partial, &tmp, opts, &mut log),
+        Format::Payload => Err(invalid("repacking payload.bin ROMs is not supported yet")),
     };
     let _ = fs::remove_dir_all(&tmp);
     match result {

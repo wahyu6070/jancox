@@ -6,6 +6,8 @@ pub mod dat;
 pub mod extract;
 pub mod factory;
 pub mod fs;
+pub mod payload;
+pub mod proto;
 pub mod rom;
 pub mod sdat;
 

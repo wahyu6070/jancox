@@ -18,18 +18,16 @@ Uncompressed EROFS is read (`fs/erofs.rs`) and written (`fs/mkerofs.rs`), and wa
 
 ## payload.bin ROMs
 
-A/B OTA zips (`payload.bin` + `payload_properties.txt`). Unpack is refused for now.
+A/B OTA zips (`payload.bin` + `payload_properties.txt`). Unpack works (`payload.rs`, `rom.rs`, `jancox payload`), checked with the ASUS ROG Phone 5 full OTA (ext4, 29 partitions, all SHA-256 match). Repack is refused for now.
 
-Do compressed EROFS (lz4/lz4hc) first: most payload ROMs (Xiaomi, OnePlus, ...) ship lz4 EROFS, so without it the dumped images can't be extracted.
+Most payload ROMs from Xiaomi, OnePlus and others ship lz4 EROFS. Until compressed EROFS works, those unpack only as far as the images: extraction fails.
 
-### Unpack
+### Unpack: open points
 
-- Read `payload.bin` straight from the zip (it is stored) with `factory::stored_range` + `fs::Window`.
-- Parse the header (`CrAU`, version 2, manifest size, metadata signature size) and the `DeltaArchiveManifest` protobuf with a small hand-written decoder (no prost/protoc).
-- Full OTAs only: REPLACE, REPLACE_XZ, REPLACE_BZ, ZSTD, ZERO, DISCARD. Check `data_sha256_hash` per operation and `new_partition_info.hash` per partition (SHA-256). Operations are independent: decode them in parallel with `std::thread::scope`.
-- Incremental OTAs (SOURCE_COPY, SOURCE_BSDIFF, BROTLI_BSDIFF, PUFFDIFF, ZUCCHINI, LZ4DIFF_*) need the old images: refuse them.
-- ext4/EROFS partitions go through `extract.rs`. The rest (boot, vendor_boot, vbmeta, firmware, ...) go to `rom/` as images.
-- Pure-Rust decoders that cross-compile for Android: xz (`lzma-rs` or our own), bzip2 (`bzip2` with the Rust backend), zstd (`ruzstd`), and `sha2`.
+- Incremental OTAs (SOURCE_COPY, SOURCE_BSDIFF, BROTLI_BSDIFF, PUFFDIFF, ZUCCHINI, LZ4DIFF_*) are refused; they need the old images.
+- A bare `payload.bin` works with `jancox payload`, but `unpack` only takes zips.
+- The logical partitions are dumped to `tmp/` before extraction, which needs their size in free space (system is 3.4 GB on the ROG Phone 5). Reading them in place would need a reader over the operations.
+- Only an ASUS payload was tested (REPLACE, REPLACE_XZ, REPLACE_BZ). ZSTD is covered by the decoder but untested on a real ROM.
 
 ### Repack, in this order
 
