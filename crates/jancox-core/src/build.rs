@@ -500,7 +500,11 @@ pub fn build(
     let dedup = info
         .get("features")
         .is_some_and(|f| f.split_whitespace().any(|x| x == "shared_blocks"));
-    let (data, used_inodes) = mkext4::data_blocks_needed(&root, bs, dedup)?;
+    // counting shared blocks reads every file: only when the size depends
+    // on it
+    let exact =
+        matches!(size, Size::Auto) || (matches!(size, Size::Original) && num("blocks").is_none());
+    let (data, used_inodes) = mkext4::data_blocks_needed(&root, bs, dedup && exact)?;
     let auto_inodes = (used_inodes as u64 + used_inodes as u64 / 50 + 64) as u32;
     // a given size keeps the old inode count unless more are needed
     let fixed_inodes = num("inodes").map_or(auto_inodes, |i| (i as u32).max(used_inodes + 1));
@@ -538,11 +542,16 @@ pub fn build(
         dedup,
     };
     log(&format!(
-        "- Image: {} blocks of {} bytes ({} MiB), {} blocks of content",
+        "- Image: {} blocks of {} bytes ({} MiB), {} blocks of content{}",
         blocks,
         bs,
         (blocks * bs) >> 20,
-        data
+        data,
+        if dedup && !exact {
+            " before block sharing"
+        } else {
+            ""
+        }
     ));
     sum.block_size = bs;
     sum.stats = mkext4::write_image(output, &root, &params).inspect_err(|_| {

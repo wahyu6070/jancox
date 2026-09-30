@@ -18,7 +18,7 @@ Uncompressed EROFS is read (`fs/erofs.rs`) and written (`fs/mkerofs.rs`), and wa
 
 ## payload.bin ROMs
 
-A/B OTA zips (`payload.bin` + `payload_properties.txt`). Unpack and repack work (`payload.rs`, `sign.rs`, `ota.rs`, `rom.rs`), checked with the ASUS ROG Phone 5 full OTA: all 29 SHA-256 match on unpack; the repacked payload passes AOSP `paycheck.py --check` with the test key, the zip signature verifies (`openssl cms`), and unpacking it again gives the same trees and images. Not flashed on a device yet.
+A/B OTA zips (`payload.bin` + `payload_properties.txt`). Unpack and repack work (`payload.rs`, `sign.rs`, `ota.rs`, `rom.rs`), checked with the ASUS ROG Phone 5 full OTA: all 29 SHA-256 match on unpack; the repacked payload passes AOSP `paycheck.py --check` with the test key, the zip signature verifies (`openssl cms`), and unpacking it again gives the same trees and images. The re-encoded xz blobs also decode with liblzma (Python `lzma`) to the right SHA-256, so they don't only work with lzma-rust2. Not flashed on a device yet.
 
 Most payload ROMs from Xiaomi, OnePlus and others ship lz4 EROFS. Until compressed EROFS works, those unpack only as far as the images: extraction fails.
 
@@ -64,6 +64,8 @@ The super partition image with all logical partitions (in some fastboot ROMs, an
 - Repack: write a new `super.img` (lpmake-like) from the rebuilt images, with the same groups, block devices and metadata size/slots, as raw or sparse.
 
 ## Repack
+
+- The sdat (surya) and fastboot (Pixel) repack paths were not run end to end again after `shared_blocks` dedup and the inode-count change in the ext4 builder (the ROMs are no longer on disk); only unit tests cover them.
 
 - AVB / dm-verity: a rebuilt partition no longer matches its hashtree and AVB footer (the tail of the partition past the filesystem, and `vbmeta*.img`). Like the old Jancox, the result only boots with verification disabled. Add an option to patch `vbmeta.img` / `vbmeta_system.img` flags (disable verity + verification), or regenerate the hashtree.
 - Fastboot ROMs: all partitions are rebuilt even when nothing changed. An unchanged partition could keep its original image, with the AVB footer and a working hashtree.
