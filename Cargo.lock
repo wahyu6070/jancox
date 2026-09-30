@@ -223,14 +223,14 @@ dependencies = [
 
 [[package]]
 name = "jancox-cli"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "jancox-core",
 ]
 
 [[package]]
 name = "jancox-core"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "brotli",
  "bzip2",

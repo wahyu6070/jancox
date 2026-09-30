@@ -49,7 +49,7 @@ curl -fsSL https://raw.githubusercontent.com/wahyu6070/jancox/master/install.sh 
 The same one line works on any Linux with `curl` (or `wget`) and `sh`. Without sudo it installs into `~/.local/bin`. Options go after `sh -s --`:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/wahyu6070/jancox/master/install.sh | sh -s -- --version v3.0.0
+curl -fsSL https://raw.githubusercontent.com/wahyu6070/jancox/master/install.sh | sh -s -- --version v3.0.1
 curl -fsSL https://raw.githubusercontent.com/wahyu6070/jancox/master/install.sh | sh -s -- --dir ~/.local/bin
 curl -fsSL https://raw.githubusercontent.com/wahyu6070/jancox/master/install.sh | sh -s -- --uninstall
 ```

@@ -7,11 +7,11 @@ ROMs that Jancox 3.x has been tested with. Add a row when you test another ROM: 
 | Device | Codename | ROM | Android | ROM type | Filesystem | Unpack | Repack | Boot | Jancox |
 |--------|----------|-----|---------|----------|------------|--------|--------|------|--------|
 | Xiaomi POCO X3 NFC | surya | crDroid | 15 | Recovery (`*.new.dat.br`, dynamic partitions) | ext4 | ✅ | ✅ | not tested | 3.0.0 |
-| Google Pixel | cubs | Factory image `cubs-cd1a.260905.001.b1` | 17 | Fastboot (`image-*.zip`, `super_empty.img`) | EROFS (uncompressed) | ✅ | ✅ | not tested | unreleased (after 3.0.0) |
-| ASUS ROG Phone 5 (ZS673KS) | ASUS_I005_1 (I005D) | Stock WW `33.0210.0210.200` (`UL-ASUS_I005_1-ASUS-33.0210.0210.200-1.1.300-2304-user.zip`) | 13 | A/B OTA (`payload.bin`, full OTA, dynamic partitions) | ext4 (`shared_blocks`) | ✅ | ✅ (OTA zip + fastboot) | not tested | unreleased (after 3.0.0) |
-| Xiaomi Redmi Note 13 4G | sapphire | HyperOS 2 Global `OS2.0.205.0.VNGMIXM` (`sapphire_global-ota_full-OS2.0.205.0.VNGMIXM-user-15.0-8f094cff3e.zip`) | 15 | A/B OTA (`payload.bin`, full OTA, dynamic partitions) | EROFS (lz4) | ✅ | ✅ | not tested | unreleased (after 3.0.0) |
-| Xiaomi POCO F4 | munch | MIUI 14 Global `V14.0.6.0.TLMMIXM` fastboot (`munch_global_images_V14.0.6.0.TLMMIXM_20240204.0000.00_13.0_global_418d21cc7e.tgz`) | 13 | Fastboot `.tgz` with sparse `super.img` | ext4 | ✅ | ✅ | not tested | unreleased (after 3.0.0) |
-| Xiaomi POCO F4 | munch | MIUI 14 Global `V14.0.6.0.TLMMIXM` recovery (`miui_MUNCHGlobal_V14.0.6.0.TLMMIXM_60b6629f69_13.0.zip`) | 13 | A/B OTA (`payload.bin`) | ext4 | ✅ | not run | not tested | unreleased (after 3.0.0) |
+| Google Pixel | cubs | Factory image `cubs-cd1a.260905.001.b1` | 17 | Fastboot (`image-*.zip`, `super_empty.img`) | EROFS (uncompressed) | ✅ | ✅ | not tested | 3.0.1 |
+| ASUS ROG Phone 5 (ZS673KS) | ASUS_I005_1 (I005D) | Stock WW `33.0210.0210.200` (`UL-ASUS_I005_1-ASUS-33.0210.0210.200-1.1.300-2304-user.zip`) | 13 | A/B OTA (`payload.bin`, full OTA, dynamic partitions) | ext4 (`shared_blocks`) | ✅ | ✅ (OTA zip + fastboot) | not tested | 3.0.1 |
+| Xiaomi Redmi Note 13 4G | sapphire | HyperOS 2 Global `OS2.0.205.0.VNGMIXM` (`sapphire_global-ota_full-OS2.0.205.0.VNGMIXM-user-15.0-8f094cff3e.zip`) | 15 | A/B OTA (`payload.bin`, full OTA, dynamic partitions) | EROFS (lz4) | ✅ | ✅ | not tested | 3.0.1 |
+| Xiaomi POCO F4 | munch | MIUI 14 Global `V14.0.6.0.TLMMIXM` fastboot (`munch_global_images_V14.0.6.0.TLMMIXM_20240204.0000.00_13.0_global_418d21cc7e.tgz`) | 13 | Fastboot `.tgz` with sparse `super.img` | ext4 | ✅ | ✅ | not tested | 3.0.1 |
+| Xiaomi POCO F4 | munch | MIUI 14 Global `V14.0.6.0.TLMMIXM` recovery (`miui_MUNCHGlobal_V14.0.6.0.TLMMIXM_60b6629f69_13.0.zip`) | 13 | A/B OTA (`payload.bin`) | ext4 | ✅ | not run | not tested | 3.0.1 |
 
 ## Notes
 
