@@ -480,18 +480,33 @@ pub fn build(
             volume_name: info.get("volume_name").cloned().unwrap_or_default(),
             timestamp: num("created").unwrap_or(DEFAULT_TIMESTAMP as u64),
             timestamp_nsec: num("created_nsec").unwrap_or(0) as u32,
+            // compressed images are rebuilt with lz4 (every EROFS kernel has it)
+            compress: info.contains_key("compression"),
         };
         let (bytes, _) = mkerofs::image_size(&root, bs)?;
-        log(&format!(
-            "- Image: EROFS, {} blocks of {} bytes ({} MiB)",
-            bytes / bs,
-            bs,
-            bytes >> 20
-        ));
+        if params.compress {
+            log(&format!(
+                "- Image: EROFS, lz4 ({} MiB before compression)",
+                bytes >> 20
+            ));
+        } else {
+            log(&format!(
+                "- Image: EROFS, {} blocks of {} bytes ({} MiB)",
+                bytes / bs,
+                bs,
+                bytes >> 20
+            ));
+        }
         sum.block_size = bs;
         sum.stats = mkerofs::write_image(output, &root, &params).inspect_err(|_| {
             let _ = fs::remove_file(output);
         })?;
+        if params.compress {
+            log(&format!(
+                "  {} MiB compressed",
+                (sum.stats.blocks * bs) >> 20
+            ));
+        }
         return Ok(sum);
     }
 

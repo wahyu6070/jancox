@@ -13,6 +13,12 @@
 //! referenced by id from each inode. Compact inodes are used unless uid,
 //! gid, size or link count need an extended one. All times are the build
 //! time. Directories hold "." and "..", sorted with the other names.
+//!
+//! With `compress`, files of a block or more are lz4-compressed the way
+//! mkfs.erofs does by default (and what Android kernels since 5.4 read):
+//! one-block physical clusters filled with as much input as fits, the data
+//! at the end of the block (`lz4_0padding`), blocks that don't compress
+//! stored plain, and a full lcluster index after the inode.
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -25,6 +31,7 @@ use super::erofs::{
 };
 use super::invalid;
 use super::mkext4::{security_xattrs, Node, NodeKind, Stats};
+use crate::lz4;
 
 #[derive(Debug, Clone)]
 pub struct Params {
@@ -34,7 +41,17 @@ pub struct Params {
     /// Build time: every inode's mtime.
     pub timestamp: u64,
     pub timestamp_nsec: u32,
+    /// lz4-compress files of a block or more.
+    pub compress: bool,
 }
+
+/// Largest extent one physical cluster may decode to.
+const MAX_EXTENT: usize = 1 << 20;
+const INCOMPAT_ZERO_PADDING: u32 = 0x1;
+const LAYOUT_COMPRESSED_FULL: u16 = 1;
+const LCLUSTER_PLAIN: u16 = 0;
+const LCLUSTER_HEAD1: u16 = 1;
+const LCLUSTER_NONHEAD: u16 = 2;
 
 const DIRENT_SIZE: usize = 12;
 /// End of the superblock: shared xattrs start here in block 0.
@@ -61,8 +78,10 @@ struct Item<'a> {
     extended: bool,
     shared: Vec<u32>,
     inline_tail: bool,
+    /// lz4-compressed, with a full lcluster index.
+    compressed: bool,
     nid: u64,
-    /// First data block of the whole blocks.
+    /// First data block of the whole blocks; compressed files: blocks used.
     blkaddr: u64,
 }
 
@@ -91,7 +110,23 @@ impl Item<'_> {
         }
     }
 
-    /// Blocks in the data area.
+    /// Bytes from the start of the inode to the first lcluster index.
+    fn index_start(&self, inode_off: u64) -> u64 {
+        // map header at the next 8-byte boundary, then 8 reserved bytes
+        (inode_off + self.isize() + self.xattr_isize()).next_multiple_of(8) + 16 - inode_off
+    }
+
+    /// Bytes of metadata at the inode: the inode, xattrs, and the inline
+    /// tail or the compression index.
+    fn record(&self, inode_off: u64, bs: u64) -> u64 {
+        if self.compressed {
+            self.index_start(inode_off) + self.size.div_ceil(bs) * 8
+        } else {
+            self.isize() + self.xattr_isize() + self.tail_len(bs)
+        }
+    }
+
+    /// Blocks in the data area (uncompressed).
     fn data_blocks(&self, bs: u64) -> u64 {
         if self.inline_tail {
             self.size / bs
@@ -163,6 +198,7 @@ fn flatten(root: &Node) -> io::Result<Vec<Item<'_>>> {
             extended: false,
             shared: Vec::new(),
             inline_tail: false,
+            compressed: false,
             nid: 0,
             blkaddr: 0,
         });
@@ -238,17 +274,19 @@ fn crc32c(mut crc: u32, data: &[u8]) -> u32 {
     crc
 }
 
-/// Size in bytes of the image `write_image` would make, and the number of
-/// inodes.
+/// Size in bytes of the image `write_image` would make without
+/// compression, and the number of inodes.
 pub fn image_size(root: &Node, block_size: u64) -> io::Result<(u64, u32)> {
     let mut items = flatten(root)?;
-    let (_, _, blocks) = layout(&mut items, block_size)?;
+    let (_, meta_end, blocks) = layout(&mut items, block_size, false)?;
+    let _ = meta_end;
     Ok((blocks * block_size, items.len() as u32))
 }
 
-/// Decides sizes, inode forms, xattr ids, nids and data blocks. Returns the
-/// shared xattr area, the end of the metadata (bytes) and the total blocks.
-fn layout(items: &mut [Item], bs: u64) -> io::Result<(Vec<u8>, u64, u64)> {
+/// Decides sizes, inode forms, xattr ids, nids and (uncompressed) data
+/// blocks. Returns the shared xattr area, the end of the metadata (bytes)
+/// and the total blocks without compression.
+fn layout(items: &mut [Item], bs: u64, compress: bool) -> io::Result<(Vec<u8>, u64, u64)> {
     // shared xattrs, from byte SB_END of block 0 (xattr_blkaddr = 0)
     let mut shared_area = Vec::new();
     let mut ids: BTreeMap<Vec<u8>, u32> = BTreeMap::new();
@@ -296,22 +334,31 @@ fn layout(items: &mut [Item], bs: u64) -> io::Result<(Vec<u8>, u64, u64)> {
         let n = item.node;
         item.extended =
             n.uid > 0xFFFF || n.gid > 0xFFFF || item.size > u32::MAX as u64 || item.nlink > 0xFFFF;
+        item.compressed =
+            compress && matches!(item.node.kind, NodeKind::File { .. }) && item.size >= bs;
         let tail = item.size % bs;
-        item.inline_tail = tail > 0 && item.isize() + item.xattr_isize() + tail <= bs;
+        item.inline_tail =
+            !item.compressed && tail > 0 && item.isize() + item.xattr_isize() + tail <= bs;
     }
 
     // nids: inodes after the shared xattrs, none crossing a block
     let mut pos = (SB_END + shared_area.len() as u64).next_multiple_of(32);
     for (i, item) in items.iter_mut().enumerate() {
-        let record = item.isize() + item.xattr_isize() + item.tail_len(bs);
-        if pos % bs + record > bs {
+        // the inode, its xattrs and inline tail stay in one block; a
+        // compression index may run on
+        let fixed = if item.compressed {
+            item.isize() + item.xattr_isize()
+        } else {
+            item.record(pos, bs)
+        };
+        if pos % bs + fixed > bs {
             pos = pos.next_multiple_of(bs);
         }
         item.nid = pos / 32;
         if i == 0 && item.nid > u16::MAX as u64 {
             return Err(invalid("too many shared xattrs: root inode out of reach"));
         }
-        pos = (pos + record).next_multiple_of(32);
+        pos = (pos + item.record(pos, bs)).next_multiple_of(32);
     }
     let meta_end = pos;
 
@@ -331,7 +378,9 @@ fn layout(items: &mut [Item], bs: u64) -> io::Result<(Vec<u8>, u64, u64)> {
 /// Writes the on-disk inode (and its xattr header) at `buf[off..]`.
 fn put_inode(buf: &mut [u8], off: usize, item: &Item, index: usize) {
     let n = item.node;
-    let layout = if item.inline_tail {
+    let layout = if item.compressed {
+        LAYOUT_COMPRESSED_FULL
+    } else if item.inline_tail {
         LAYOUT_FLAT_INLINE
     } else {
         LAYOUT_FLAT_PLAIN
@@ -388,73 +437,107 @@ pub fn write_image(out: &Path, root: &Node, p: &Params) -> io::Result<Stats> {
         return Err(invalid("volume name longer than 16 bytes"));
     }
     let mut items = flatten(root)?;
-    let (shared_area, meta_end, blocks) = layout(&mut items, bs)?;
+    let (shared_area, meta_end, _) = layout(&mut items, bs, p.compress)?;
 
     let mut meta = vec![0u8; meta_end.next_multiple_of(bs) as usize];
     let s = SB_END as usize;
     meta[s..s + shared_area.len()].copy_from_slice(&shared_area);
 
     let file = File::create(out)?;
-    file.set_len(blocks * bs)?;
     let mut data = BufWriter::with_capacity(1 << 20, file);
-    data.seek(SeekFrom::Start(meta_end.div_ceil(bs) * bs))?;
-
+    let mut next_block = meta_end.div_ceil(bs);
+    data.seek(SeekFrom::Start(next_block * bs))?;
     let mut buf = vec![0u8; 1 << 20];
-    for i in 0..items.len() {
-        let item = &items[i];
-        let off = (item.nid * 32) as usize;
-        put_inode(&mut meta, off, item, i);
-        if item.extended {
-            meta[off + 32..off + 40].copy_from_slice(&p.timestamp.to_le_bytes());
-            meta[off + 40..off + 44].copy_from_slice(&p.timestamp_nsec.to_le_bytes());
-        }
-        let tail_len = item.tail_len(bs) as usize;
-        let body = item.size - tail_len as u64;
-        let tail_at = off + (item.isize() + item.xattr_isize()) as usize;
 
-        // content: body -> data blocks, tail -> after the inode
-        match &item.node.kind {
-            NodeKind::File { source, size } => {
-                let mut f = File::open(source).map_err(|e| {
-                    io::Error::new(e.kind(), format!("{}: {}", source.display(), e))
-                })?;
-                let mut left = body;
-                while left > 0 {
-                    let n = left.min(buf.len() as u64) as usize;
-                    f.read_exact(&mut buf[..n])
-                        .map_err(|e| changed(source, e))?;
-                    data.write_all(&buf[..n])?;
-                    left -= n as u64;
-                }
-                f.read_exact(&mut meta[tail_at..tail_at + tail_len])
-                    .map_err(|e| changed(source, e))?;
-                if f.read(&mut buf[..1])? != 0 || f.metadata()?.len() != *size {
-                    return Err(changed(source, io::ErrorKind::InvalidData.into()));
-                }
-            }
-            NodeKind::Symlink(target) => {
-                let (b, t) = target.split_at(body as usize);
-                data.write_all(b)?;
-                meta[tail_at..tail_at + tail_len].copy_from_slice(t);
-            }
-            NodeKind::Dir(_) => {
-                let d = dir_data(&items, item, bs as usize);
-                let (b, t) = d.split_at(body as usize);
-                data.write_all(b)?;
-                meta[tail_at..tail_at + tail_len].copy_from_slice(t);
+    // compressed files go through the thread pool in segments; everything
+    // is written in inode order
+    let mut jobs = Vec::new();
+    for (i, item) in items.iter().enumerate() {
+        if let (true, NodeKind::File { source, size }) = (item.compressed, &item.node.kind) {
+            let mut start = 0;
+            while start < *size {
+                let len = SEGMENT.min(size - start);
+                jobs.push((i, source.clone(), *size, start, len));
+                start += len;
             }
         }
-        // pad the last data block
-        let pad = (bs - body % bs) % bs;
-        if pad > 0 {
-            io::copy(&mut io::repeat(0).take(pad), &mut data)?;
-        }
+    }
+    let any_compressed = !jobs.is_empty();
+    let mut jobs = jobs.into_iter();
+    let mut next_item = 0usize;
+    // extents of the file being written: (logical start, type, block)
+    let mut extents: Vec<(u64, u16, u64)> = Vec::new();
+    let mut first_block = 0u64;
+    crate::par::pipeline(
+        crate::payload::default_threads(),
+        || Ok(jobs.next()),
+        |(i, source, size, start, len)| {
+            ENCODER.with(|e| {
+                let piece = compress_segment(&source, size, start, len, bs, &mut e.borrow_mut())?;
+                Ok((i, start + len == size, piece))
+            })
+        },
+        |(i, last, (pieces, blocks))| {
+            while next_item < i {
+                write_flat(
+                    &mut items,
+                    next_item,
+                    &mut meta,
+                    &mut data,
+                    &mut next_block,
+                    &mut buf,
+                    p,
+                )?;
+                next_item += 1;
+            }
+            if extents.is_empty() {
+                first_block = next_block;
+            }
+            for (la, kind) in pieces {
+                extents.push((la, kind, next_block));
+                next_block += 1;
+            }
+            data.write_all(&blocks)?;
+            if last {
+                let off = (items[i].nid * 32) as usize;
+                let index = lcluster_index(&extents, items[i].size, bs);
+                let at = off + items[i].index_start(off as u64) as usize;
+                meta[at..at + index.len()].copy_from_slice(&index);
+                items[i].blkaddr = next_block - first_block;
+                put_inode(&mut meta, off, &items[i], i);
+                put_times(&mut meta, off, &items[i], p);
+                extents.clear();
+                next_item = i + 1;
+            }
+            Ok(())
+        },
+    )?;
+    while next_item < items.len() {
+        write_flat(
+            &mut items,
+            next_item,
+            &mut meta,
+            &mut data,
+            &mut next_block,
+            &mut buf,
+            p,
+        )?;
+        next_item += 1;
+    }
+    let blocks = next_block;
+    if blocks > u32::MAX as u64 {
+        return Err(invalid("image too big for EROFS block addresses"));
     }
 
     // superblock
     let sb = &mut meta[SUPERBLOCK_OFFSET as usize..SB_END as usize];
     sb[0..4].copy_from_slice(&EROFS_MAGIC.to_le_bytes());
     sb[8..12].copy_from_slice(&COMPAT_SB_CHKSUM.to_le_bytes());
+    if any_compressed {
+        // lz4 with 0padding, the default 64 KiB window
+        sb[80..84].copy_from_slice(&INCOMPAT_ZERO_PADDING.to_le_bytes());
+        sb[84..86].copy_from_slice(&u16::MAX.to_le_bytes());
+    }
     sb[12] = bs.trailing_zeros() as u8;
     sb[14..16].copy_from_slice(&(items[0].nid as u16).to_le_bytes());
     sb[16..24].copy_from_slice(&(items.len() as u64).to_le_bytes());
@@ -471,12 +554,177 @@ pub fn write_image(out: &Path, root: &Node, p: &Params) -> io::Result<Stats> {
     data.seek(SeekFrom::Start(0))?;
     data.write_all(&meta)?;
     data.flush()?;
+    data.get_ref().set_len(blocks * bs)?;
     Ok(Stats {
         blocks,
         used_blocks: blocks,
         inodes: items.len() as u32,
         used_inodes: items.len() as u32,
     })
+}
+
+/// Files are compressed in pieces of this size, in parallel; each piece
+/// starts a new extent (at an lcluster boundary).
+const SEGMENT: u64 = 4 << 20;
+
+thread_local! {
+    static ENCODER: std::cell::RefCell<lz4::Encoder> = std::cell::RefCell::new(lz4::Encoder::new(16));
+}
+
+/// A compressed piece of a file: each block's (logical start, lcluster
+/// type), and the blocks.
+type Compressed = (Vec<(u64, u16)>, Vec<u8>);
+
+/// Compresses `len` bytes of a file from `start` into one-block physical
+/// clusters. Returns each block's extent (logical start, lcluster type)
+/// and the blocks.
+fn compress_segment(
+    source: &Path,
+    size: u64,
+    start: u64,
+    len: u64,
+    bs: u64,
+    enc: &mut lz4::Encoder,
+) -> io::Result<Compressed> {
+    let bsz = bs as usize;
+    let mut f = File::open(source)
+        .map_err(|e| io::Error::new(e.kind(), format!("{}: {}", source.display(), e)))?;
+    if f.metadata()?.len() != size {
+        return Err(changed(source, io::ErrorKind::InvalidData.into()));
+    }
+    f.seek(SeekFrom::Start(start))?;
+    let mut seg = vec![0u8; len as usize];
+    f.read_exact(&mut seg).map_err(|e| changed(source, e))?;
+    let mut extents = Vec::new();
+    let mut blocks = Vec::with_capacity(seg.len() / 2);
+    let mut pos = 0usize;
+    while pos < seg.len() {
+        let la = start + pos as u64;
+        let src = &seg[pos..seg.len().min(pos + MAX_EXTENT)];
+        let (out, used) = enc.compress_dest(src, bsz);
+        let at = blocks.len();
+        blocks.resize(at + bsz, 0);
+        let block = &mut blocks[at..];
+        let (kind, n) = if used >= bsz {
+            // compressed data at the end of the block
+            block[bsz - out.len()..].copy_from_slice(&out);
+            (LCLUSTER_HEAD1, used)
+        } else {
+            // doesn't compress: plain. A plain extent that ends the file
+            // must not run into another lcluster: the kernel maps it up to
+            // that lcluster's end and then finds it longer than its block
+            let mut n = bsz.min(src.len());
+            let ofs = (la % bs) as usize;
+            if la + n as u64 == size && ofs + n > bsz {
+                n = bsz - ofs;
+            }
+            block[..n].copy_from_slice(&src[..n]);
+            (LCLUSTER_PLAIN, n)
+        };
+        extents.push((la, kind));
+        pos += n;
+    }
+    Ok((extents, blocks))
+}
+
+/// The full lcluster index of a compressed file: a HEAD where an extent
+/// starts, else a NONHEAD with the distances to its head and to the next.
+fn lcluster_index(extents: &[(u64, u16, u64)], size: u64, bs: u64) -> Vec<u8> {
+    let nlc = size.div_ceil(bs);
+    let mut index = vec![0u8; (nlc * 8) as usize];
+    let heads: Vec<u64> = extents.iter().map(|e| e.0 / bs).collect();
+    let mut e = 0usize;
+    for lcn in 0..nlc {
+        while e + 1 < extents.len() && heads[e + 1] <= lcn {
+            e += 1;
+        }
+        let d = &mut index[(lcn * 8) as usize..(lcn * 8 + 8) as usize];
+        if heads[e] == lcn {
+            let (start, kind, blk) = extents[e];
+            d[0..2].copy_from_slice(&kind.to_le_bytes());
+            d[2..4].copy_from_slice(&((start % bs) as u16).to_le_bytes());
+            d[4..8].copy_from_slice(&(blk as u32).to_le_bytes());
+        } else {
+            let next = heads.get(e + 1).copied().unwrap_or(nlc);
+            d[0..2].copy_from_slice(&LCLUSTER_NONHEAD.to_le_bytes());
+            d[4..6].copy_from_slice(&((lcn - heads[e]) as u16).to_le_bytes());
+            d[6..8].copy_from_slice(&((next - lcn) as u16).to_le_bytes());
+        }
+    }
+    index
+}
+
+/// Times of an extended inode (compact ones use the build time).
+fn put_times(meta: &mut [u8], off: usize, item: &Item, p: &Params) {
+    if item.extended {
+        meta[off + 32..off + 40].copy_from_slice(&p.timestamp.to_le_bytes());
+        meta[off + 40..off + 44].copy_from_slice(&p.timestamp_nsec.to_le_bytes());
+    }
+}
+
+/// Writes an uncompressed item: whole blocks to the data area, the tail
+/// after the inode.
+fn write_flat<W: Write>(
+    items: &mut [Item],
+    i: usize,
+    meta: &mut [u8],
+    data: &mut W,
+    next_block: &mut u64,
+    buf: &mut [u8],
+    p: &Params,
+) -> io::Result<()> {
+    let bs = p.block_size;
+    if items[i].compressed {
+        return Ok(());
+    }
+    let n = items[i].data_blocks(bs);
+    items[i].blkaddr = if n > 0 { *next_block } else { 0 };
+    *next_block += n;
+    let item = &items[i];
+    let off = (item.nid * 32) as usize;
+    put_inode(meta, off, item, i);
+    put_times(meta, off, item, p);
+    let tail_len = item.tail_len(bs) as usize;
+    let body = item.size - tail_len as u64;
+    let tail_at = off + (item.isize() + item.xattr_isize()) as usize;
+
+    // content: body -> data blocks, tail -> after the inode
+    match &item.node.kind {
+        NodeKind::File { source, size } => {
+            let mut f = File::open(source)
+                .map_err(|e| io::Error::new(e.kind(), format!("{}: {}", source.display(), e)))?;
+            let mut left = body;
+            while left > 0 {
+                let n = left.min(buf.len() as u64) as usize;
+                f.read_exact(&mut buf[..n])
+                    .map_err(|e| changed(source, e))?;
+                data.write_all(&buf[..n])?;
+                left -= n as u64;
+            }
+            f.read_exact(&mut meta[tail_at..tail_at + tail_len])
+                .map_err(|e| changed(source, e))?;
+            if f.read(&mut buf[..1])? != 0 || f.metadata()?.len() != *size {
+                return Err(changed(source, io::ErrorKind::InvalidData.into()));
+            }
+        }
+        NodeKind::Symlink(target) => {
+            let (b, t) = target.split_at(body as usize);
+            data.write_all(b)?;
+            meta[tail_at..tail_at + tail_len].copy_from_slice(t);
+        }
+        NodeKind::Dir(_) => {
+            let d = dir_data(items, item, bs as usize);
+            let (b, t) = d.split_at(body as usize);
+            data.write_all(b)?;
+            meta[tail_at..tail_at + tail_len].copy_from_slice(t);
+        }
+    }
+    // pad the last data block
+    let pad = (bs - body % bs) % bs;
+    if pad > 0 {
+        io::copy(&mut io::repeat(0).take(pad), data)?;
+    }
+    Ok(())
 }
 
 fn changed(path: &Path, e: io::Error) -> io::Error {
@@ -522,13 +770,32 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let mut files = Vec::new();
+        let mut x = 1u32;
+        let mut noise = move || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x as u8
+        };
         for (name, len) in [
             ("empty", 0usize),
             ("small", 5),
             ("tail", 10000),
             ("exact", 8192),
+            ("text", 300_001),
+            ("rand", 20000),
+            ("zero", 1 << 20),
+            ("mixed", 50000),
         ] {
-            let data: Vec<u8> = (0..len).map(|i| (i * 7 % 251) as u8).collect();
+            let data: Vec<u8> = (0..len)
+                .map(|i| match name {
+                    "rand" => noise(),
+                    "zero" => 0,
+                    "mixed" if i % 10000 < 3000 => noise(),
+                    "text" | "mixed" => b"jancox erofs lz4 \n"[i % 17],
+                    _ => (i * 7 % 251) as u8,
+                })
+                .collect();
             let path = dir.join(name);
             std::fs::write(&path, &data).unwrap();
             files.push((name, data, path));
@@ -565,44 +832,49 @@ mod tests {
         children.push(node("many", NodeKind::Dir(many), 0o755, 0));
         let root = node("", NodeKind::Dir(children), 0o755, 0);
 
-        let img = dir.join("test.img");
-        let params = Params {
-            block_size: 4096,
-            uuid: [7; 16],
-            volume_name: "".into(),
-            timestamp: 1_230_768_000,
-            timestamp_nsec: 0,
-        };
-        let stats = write_image(&img, &root, &params).unwrap();
-        assert_eq!(stats.used_inodes, 1 + 4 + 2 + 1 + 300);
-        assert_eq!(
-            image_size(&root, 4096).unwrap().0,
-            std::fs::metadata(&img).unwrap().len()
-        );
+        for compress in [false, true] {
+            let img = dir.join("test.img");
+            let params = Params {
+                block_size: 4096,
+                uuid: [7; 16],
+                volume_name: "".into(),
+                timestamp: 1_230_768_000,
+                timestamp_nsec: 0,
+                compress,
+            };
+            let stats = write_image(&img, &root, &params).unwrap();
+            assert_eq!(stats.used_inodes, 1 + 8 + 2 + 1 + 300);
+            let len = std::fs::metadata(&img).unwrap().len();
+            if compress {
+                assert!(len * 3 < image_size(&root, 4096).unwrap().0, "{}", len);
+            } else {
+                assert_eq!(image_size(&root, 4096).unwrap().0, len);
+            }
 
-        let mut fs = Erofs::open(File::open(&img).unwrap()).unwrap();
-        let top: BTreeMap<Vec<u8>, u64> = fs.read_dir(fs.root()).unwrap().into_iter().collect();
-        assert_eq!(top.len(), 7);
-        for (name, data, _) in &files {
-            let nid = top[name.as_bytes()];
-            let mut out = Vec::new();
-            assert_eq!(fs.read_file(nid, &mut out).unwrap(), data.len() as u64);
-            assert_eq!(&out, data, "{}", name);
-            let m = fs.meta(nid).unwrap();
-            assert_eq!((m.kind, m.mode, m.gid), (Kind::File, 0o644, 2000));
-            assert_eq!(m.selinux.as_deref(), Some("u:object_r:system_file:s0"));
-            assert_eq!(m.mtime, 1_230_768_000);
+            let mut fs = Erofs::open(File::open(&img).unwrap()).unwrap();
+            let top: BTreeMap<Vec<u8>, u64> = fs.read_dir(fs.root()).unwrap().into_iter().collect();
+            assert_eq!(top.len(), 11);
+            for (name, data, _) in &files {
+                let nid = top[name.as_bytes()];
+                let mut out = Vec::new();
+                assert_eq!(fs.read_file(nid, &mut out).unwrap(), data.len() as u64);
+                assert_eq!(&out, data, "{}", name);
+                let m = fs.meta(nid).unwrap();
+                assert_eq!((m.kind, m.mode, m.gid), (Kind::File, 0o644, 2000));
+                assert_eq!(m.selinux.as_deref(), Some("u:object_r:system_file:s0"));
+                assert_eq!(m.mtime, 1_230_768_000);
+            }
+            let m = fs.meta(top[&b"run-as"[..]]).unwrap();
+            assert_eq!(
+                (m.uid, m.mode, m.capabilities),
+                (100_000, 0o750, Some(0xc0))
+            );
+            assert_eq!(fs.read_link(top[&b"link"[..]]).unwrap(), b"/system/bin/sh");
+            let many = fs.read_dir(top[&b"many"[..]]).unwrap();
+            assert_eq!(many.len(), 300);
+            assert!(many.windows(2).all(|w| w[0].0 < w[1].0));
+            assert_eq!(fs.meta(many[299].1).unwrap().kind, Kind::Dir);
         }
-        let m = fs.meta(top[&b"run-as"[..]]).unwrap();
-        assert_eq!(
-            (m.uid, m.mode, m.capabilities),
-            (100_000, 0o750, Some(0xc0))
-        );
-        assert_eq!(fs.read_link(top[&b"link"[..]]).unwrap(), b"/system/bin/sh");
-        let many = fs.read_dir(top[&b"many"[..]]).unwrap();
-        assert_eq!(many.len(), 300);
-        assert!(many.windows(2).all(|w| w[0].0 < w[1].0));
-        assert_eq!(fs.meta(many[299].1).unwrap().kind, Kind::Dir);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

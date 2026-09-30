@@ -10,14 +10,14 @@ EROFS is read (`fs/erofs.rs`, compressed files in `fs/erofs/z.rs`) and written u
 
 - Reader: the new extent-record format (`Z_EROFS_ADVISE_EXTENTS`) and `48bit` / `metabox` images are untested (no mkfs here makes the first by default; the others are refused).
 - Writer: no chunk-based dedupe or holes. Pixel images share identical blocks and leave zero blocks as holes; ours are up to about 6% bigger (vendor 1.21 GB vs 1.14 GB). Pixel partitions fit the super group easily, but on a recovery ROM with EROFS and fixed-size partitions (no `dynamic_partitions_op_list`), even an unchanged rebuild can exceed the partition and fail with "remove some files". Holes and chunk dedupe fix that.
-- Writer: no compression. A compressed EROFS ROM rebuilt uncompressed doesn't fit: the Redmi Note 13 4G partitions need 8.99 GB uncompressed against a 7.16 GiB super group, and repack stops with a message saying so. An lz4 writer (fixed-input big pclusters) is next.
+- Writer: lz4 only (every compressed original is rebuilt with lz4), one-block pclusters, full indexes, no ztailpacking/fragments/dedupe. Enough for the Redmi Note 13 4G (repacked images within 1% of Xiaomi's lz4hc ones); big pclusters or lz4hc-style optimal parsing would make them smaller.
 - Writer: no xattr bloom filter (`xattr_filter`) and no `mtime` feature bit. Every inode gets the build time.
 
 ## payload.bin ROMs
 
 A/B OTA zips (`payload.bin` + `payload_properties.txt`). Unpack and repack work (`payload.rs`, `sign.rs`, `ota.rs`, `rom.rs`), checked with the ASUS ROG Phone 5 full OTA: all 29 SHA-256 match on unpack; the repacked payload passes AOSP `paycheck.py --check` with the test key, the zip signature verifies (`openssl cms`), and unpacking it again gives the same trees and images. The re-encoded xz blobs also decode with liblzma (Python `lzma`) to the right SHA-256, so they don't only work with lzma-rust2. Not flashed on a device yet.
 
-Most payload ROMs from Xiaomi, OnePlus and others ship lz4 EROFS: they unpack (Redmi Note 13 4G checked), but don't repack until the EROFS writer compresses.
+Most payload ROMs from Xiaomi, OnePlus and others ship lz4 EROFS: they unpack and repack (Redmi Note 13 4G checked).
 
 ### Open points
 

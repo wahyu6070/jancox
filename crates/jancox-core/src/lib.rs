@@ -9,6 +9,7 @@ pub mod fs;
 pub mod lp;
 pub mod lz4;
 pub mod ota;
+pub mod par;
 pub mod payload;
 pub mod proto;
 pub mod rom;

@@ -9,7 +9,7 @@ ROMs that Jancox 3.x has been tested with. Add a row when you test another ROM: 
 | Xiaomi POCO X3 NFC | surya | crDroid | 15 | Recovery (`*.new.dat.br`, dynamic partitions) | ext4 | ✅ | ✅ | not tested | 3.0.0 |
 | Google Pixel | cubs | Factory image `cubs-cd1a.260905.001.b1` | 17 | Fastboot (`image-*.zip`, `super_empty.img`) | EROFS (uncompressed) | ✅ | ✅ | not tested | unreleased (after 3.0.0) |
 | ASUS ROG Phone 5 (ZS673KS) | ASUS_I005_1 (I005D) | Stock WW `33.0210.0210.200` (`UL-ASUS_I005_1-ASUS-33.0210.0210.200-1.1.300-2304-user.zip`) | 13 | A/B OTA (`payload.bin`, full OTA, dynamic partitions) | ext4 (`shared_blocks`) | ✅ | ✅ (OTA zip + fastboot) | not tested | unreleased (after 3.0.0) |
-| Xiaomi Redmi Note 13 4G | sapphire | HyperOS 2 Global `OS2.0.205.0.VNGMIXM` (`sapphire_global-ota_full-OS2.0.205.0.VNGMIXM-user-15.0-8f094cff3e.zip`) | 15 | A/B OTA (`payload.bin`, full OTA, dynamic partitions) | EROFS (lz4) | ✅ | ❌ needs a compressing EROFS writer | not tested | unreleased (after 3.0.0) |
+| Xiaomi Redmi Note 13 4G | sapphire | HyperOS 2 Global `OS2.0.205.0.VNGMIXM` (`sapphire_global-ota_full-OS2.0.205.0.VNGMIXM-user-15.0-8f094cff3e.zip`) | 15 | A/B OTA (`payload.bin`, full OTA, dynamic partitions) | EROFS (lz4) | ✅ | ✅ | not tested | unreleased (after 3.0.0) |
 | Xiaomi POCO F4 | munch | MIUI 14 Global `V14.0.6.0.TLMMIXM` fastboot (`munch_global_images_V14.0.6.0.TLMMIXM_20240204.0000.00_13.0_global_418d21cc7e.tgz`) | 13 | Fastboot `.tgz` with sparse `super.img` | ext4 | ✅ | ✅ | not tested | unreleased (after 3.0.0) |
 | Xiaomi POCO F4 | munch | MIUI 14 Global `V14.0.6.0.TLMMIXM` recovery (`miui_MUNCHGlobal_V14.0.6.0.TLMMIXM_60b6629f69_13.0.zip`) | 13 | A/B OTA (`payload.bin`) | ext4 | ✅ | not run | not tested | unreleased (after 3.0.0) |
 
@@ -38,7 +38,8 @@ ROMs that Jancox 3.x has been tested with. Add a row when you test another ROM: 
 
 - A/B full OTA: `payload.bin` with 29 partitions; the dynamic group `qti_dynamic_partitions` holds odm, product, system, system_dlkm, system_ext, vendor, vendor_dlkm and mi_ext, all EROFS with lz4 (0padding, one-block pclusters).
 - Unpack (about 1.7 minutes): all 8 partitions extract identical to `fsck.erofs --extract` 1.9.4; vendor also matches a kernel loop mount (contents, owners, modes, SELinux labels).
-- Repack stops with a clear message: uncompressed, the partitions need 8.99 GB, more than the 7.16 GiB super group. It needs an EROFS writer with compression.
+- Uncompressed the partitions would need 8.99 GB, more than the 7.16 GiB super group, so repack rebuilds them with lz4: product 2903 MiB (Xiaomi: 2910), system 759 (758), system_ext 602 (599), vendor 878 (874). The rebuilt images pass `fsck.erofs` 1.9.4 (with `--extract`, full decoding) and match a kernel loop mount.
+- Repack takes about 3.8 minutes; the new OTA passes AOSP `paycheck.py --check`, and unpacking it gives the same folders and metadata for all 8 partitions.
 
 ### Xiaomi POCO F4 (munch), MIUI 14 V14.0.6.0.TLMMIXM, Android 13
 

@@ -181,7 +181,7 @@ jancox brotli   [-d] [-q quality] [-w window] [-o output] <file>
 
 ## Limitations
 
-- EROFS images are read with any compression (lz4, lzma, deflate, zstd), but rebuilt without compression. A ROM whose partitions were compressed EROFS (most Xiaomi, OnePlus, ... ROMs) usually doesn't fit its super partition when repacked; repack says so.
+- EROFS images are read with any compression (lz4, lzma, deflate, zstd). A compressed partition is rebuilt with lz4 (one-block clusters, like mkfs.erofs' default, readable by Android kernels since 5.4), whatever algorithm it had.
 - Incremental OTAs (payload.bin patches) are refused.
 - Older Xiaomi fastboot ROMs without `super.img` (separate `system.img`, ...) are not supported.
 - A repacked partition no longer matches its dm-verity hashtree / AVB data, so the ROM only boots with verification disabled (as with older Jancox versions). For fastboot ROMs, repack sets the "disable verity + verification" flags in `vbmeta.img`; this needs an unlocked bootloader, and the first flash with these flags needs a data wipe (`flash-all.sh` wipes by default).
