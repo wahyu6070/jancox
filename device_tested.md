@@ -38,7 +38,7 @@ ROMs that Jancox 3.x has been tested with. Add a row when you test another ROM: 
 
 - A/B full OTA: `payload.bin` with 29 partitions; the dynamic group `qti_dynamic_partitions` holds odm, product, system, system_dlkm, system_ext, vendor, vendor_dlkm and mi_ext, all EROFS with lz4 (0padding, one-block pclusters).
 - Unpack (about 1.7 minutes): all 8 partitions extract identical to `fsck.erofs --extract` 1.9.4; vendor also matches a kernel loop mount (contents, owners, modes, SELinux labels).
-- Uncompressed the partitions would need 8.99 GB, more than the 7.16 GiB super group, so repack rebuilds them with lz4: product 2903 MiB (Xiaomi: 2910), system 759 (758), system_ext 602 (599), vendor 878 (874). The rebuilt images pass `fsck.erofs` 1.9.4 (with `--extract`, full decoding) and match a kernel loop mount.
+- Uncompressed the partitions would need 8.99 GB, more than the 7.16 GiB super group, so repack rebuilds them with lz4: product 2903 MiB (Xiaomi: 2910), system 759 (758), system_ext 602 (599), vendor 878 (874). All 8 rebuilt images in the final OTA pass `fsck.erofs` 1.9.4 (with `--extract`, full decoding) and match a kernel loop mount; on system and vendor the mount also shows the same owners, modes and SELinux labels (0 differences in 7840 entries).
 - Repack takes about 3.8 minutes; the new OTA passes AOSP `paycheck.py --check`, and unpacking it gives the same folders and metadata for all 8 partitions.
 
 ### Xiaomi POCO F4 (munch), MIUI 14 V14.0.6.0.TLMMIXM, Android 13

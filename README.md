@@ -164,7 +164,7 @@ Put the fastboot ROM (e.g. `munch_global_images_V14.0.6.0.TLMMIXM_..._13.0_globa
 
 ```
 jancox init     [-w workdir]
-jancox unpack   [rom.zip] [-w workdir]
+jancox unpack   [rom] [-w workdir]                      zip / tgz / tar / payload.bin
 jancox repack   [-w workdir] [-o out.zip] [-b brotli_quality] [-z zip_level] [-t auto|fastboot|sdat|payload|super,...]
 jancox cleanup  [-w workdir] [--all]
 

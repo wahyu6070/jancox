@@ -1891,6 +1891,12 @@ fn write_ota<R: Read + Seek + Send>(
         metadata_with_signature: metadata_with_sig,
     };
     let old_meta = fs::read_to_string(rom_dir.join(ota::METADATA)).unwrap_or_default();
+    if old_meta.is_empty() {
+        log("[!] No META-INF/com/android/metadata (the ROM was a bare payload.bin).");
+        log("    Recoveries refuse an A/B OTA zip without it (ota-type, pre-device).");
+        log("    Flash the fastboot output instead (repack -t fastboot), or unpack the");
+        log("    original OTA zip rather than its payload.bin.");
+    }
     let old_pb = fs::read(rom_dir.join(ota::METADATA_PB)).unwrap_or_default();
     let cert = key.cert_pem();
     let stored = zip_options(opts).1;

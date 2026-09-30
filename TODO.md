@@ -10,7 +10,7 @@ EROFS is read (`fs/erofs.rs`, compressed files in `fs/erofs/z.rs`) and written u
 
 - Reader: the new extent-record format (`Z_EROFS_ADVISE_EXTENTS`) and `48bit` / `metabox` images are untested (no mkfs here makes the first by default; the others are refused).
 - Writer: no chunk-based dedupe or holes. Pixel images share identical blocks and leave zero blocks as holes; ours are up to about 6% bigger (vendor 1.21 GB vs 1.14 GB). Pixel partitions fit the super group easily, but on a recovery ROM with EROFS and fixed-size partitions (no `dynamic_partitions_op_list`), even an unchanged rebuild can exceed the partition and fail with "remove some files". Holes and chunk dedupe fix that.
-- Writer: lz4 only (every compressed original is rebuilt with lz4), one-block pclusters, full indexes, no ztailpacking/fragments/dedupe. Enough for the Redmi Note 13 4G (repacked images within 1% of Xiaomi's lz4hc ones); big pclusters or lz4hc-style optimal parsing would make them smaller.
+- Writer: lz4 only (every compressed original is rebuilt with lz4), one-block pclusters, full indexes, no ztailpacking/fragments/dedupe. Extents decode to at most 1 MiB, which Xiaomi's own images also reach (their largest compressed extents are 512 KiB-1 MiB). Enough for the Redmi Note 13 4G (repacked images within 1% of Xiaomi's lz4hc ones); big pclusters or lz4hc-style optimal parsing would make them smaller.
 - Writer: no xattr bloom filter (`xattr_filter`) and no `mtime` feature bit. Every inode gets the build time.
 
 ## payload.bin ROMs
@@ -22,7 +22,7 @@ Most payload ROMs from Xiaomi, OnePlus and others ship lz4 EROFS: they unpack an
 ### Open points
 
 - Incremental OTAs (SOURCE_COPY, SOURCE_BSDIFF, BROTLI_BSDIFF, PUFFDIFF, ZUCCHINI, LZ4DIFF_*) are refused; they need the old images.
-- A bare `payload.bin` unpacks, but its repacked OTA zip has no `META-INF/com/android/metadata` (the original zip's is needed).
+- A bare `payload.bin` unpacks and repacks (checked with the ROG Phone 5 payload: paycheck passes), but its OTA zip has no `META-INF/com/android/metadata`, so recoveries refuse it; repack warns and points to `-t fastboot`. Making the metadata would need the device name (`pre-device`), which the images don't reliably give.
 - The logical partitions are dumped to `tmp/` before extraction, which needs their size in free space (system is 3.4 GB on the ROG Phone 5). Reading them in place would need a reader over the operations.
 - Only an ASUS payload was tested (REPLACE, REPLACE_XZ, REPLACE_BZ). ZSTD is covered by the decoder but untested on a real ROM.
 - Repack rebuilds every logical partition even when unchanged (like fastboot ROMs); an untouched partition could keep its old operations and hashtree.
@@ -65,7 +65,7 @@ Done: `lp.rs`, `sparse.rs`, `superrom.rs`, `jancox super`. Checked with the POCO
 
 ## Repack
 
-- The sdat (surya) and fastboot (Pixel) repack paths were not run end to end again after `shared_blocks` dedup and the inode-count change in the ext4 builder (the ROMs are no longer on disk); only unit tests cover them.
+- The sdat (surya) and fastboot (Pixel) repack paths were not run end to end again after `shared_blocks` dedup, the inode-count change in the ext4 builder and the EROFS writer rewrite (the ROMs are no longer on disk). Unit tests cover them, a synthetic sdat ROM made from POCO F4 images round-trips, and the uncompressed EROFS path was re-checked on Xiaomi partitions (fsck.erofs, kernel mount, round trip).
 
 - AVB / dm-verity: a rebuilt partition no longer matches its hashtree and AVB footer (the tail of the partition past the filesystem, and `vbmeta*.img`). Like the old Jancox, the result only boots with verification disabled. Add an option to patch `vbmeta.img` / `vbmeta_system.img` flags (disable verity + verification), or regenerate the hashtree.
 - Fastboot ROMs: all partitions are rebuilt even when nothing changed. An unchanged partition could keep its original image, with the AVB footer and a working hashtree.

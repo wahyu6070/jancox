@@ -25,10 +25,12 @@ fn usage() {
     );
     out!("  init [-w workdir]");
     out!("      Make input/, output/ and jancox.prop (brotli/zip levels) if missing");
-    out!("  unpack [rom.zip] [-w workdir]");
-    out!("      Unpack a ROM zip (default: <workdir>/input/*.zip or input.zip) into editable folders");
+    out!("  unpack [rom] [-w workdir]");
+    out!("      Unpack a ROM into editable folders: zip, tgz / tar.gz, tar or payload.bin");
+    out!("      (default: the ROM in <workdir>/input/, any name; else input.zip, input.tgz,");
+    out!("      input.tar.gz, input.tar or payload.bin in <workdir>)");
     out!("  repack [-w workdir] [-o out.zip] [-b brotli_quality] [-z zip_level] [-t type]");
-    out!("      Build a new ROM zip in <workdir>/output/ (default: jancox.prop, else -b 1 -z 1)");
+    out!("      Build a new ROM in <workdir>/output/ (default: jancox.prop, else -b 1 -z 1)");
     out!(
         "      -t: output formats (auto = like the input; fastboot, sdat, payload, super; a list)"
     );
@@ -511,7 +513,7 @@ fn workdir(args: &[String], usage: &str) -> Result<(PathBuf, Vec<String>), Strin
 }
 
 fn unpack(args: &[String]) -> Result<(), String> {
-    const USAGE: &str = "usage: jancox unpack [rom.zip] [-w workdir]";
+    const USAGE: &str = "usage: jancox unpack [rom] [-w workdir]";
     let (work, rest) = workdir(args, USAGE)?;
     let input = match rest.as_slice() {
         [] => match rom::find_input(&work) {
@@ -520,7 +522,7 @@ fn unpack(args: &[String]) -> Result<(), String> {
                 // set up the folder so the user knows where the ROM goes
                 let _ = rom::init(&work);
                 return Err(format!(
-                    "no ROM zip found; put it in {} or give its path\n{}",
+                    "no ROM found; put the zip, tgz, tar or payload.bin in {} or give its path\n{}",
                     work.join("input").display(),
                     USAGE
                 ));
@@ -596,7 +598,7 @@ fn init(args: &[String]) -> Result<(), String> {
         out!("- Nothing to do: input/, output/ and jancox.prop already exist");
     }
     out!(
-        "- Put the ROM zip in {}, then run: jancox unpack",
+        "- Put the ROM (zip, tgz, tar or payload.bin) in {}, then run: jancox unpack",
         work.join("input").display()
     );
     Ok(())
