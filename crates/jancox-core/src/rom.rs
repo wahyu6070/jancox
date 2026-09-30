@@ -33,7 +33,7 @@ use zip::{CompressionMethod, ZipArchive, ZipWriter};
 use crate::build::{self, Size};
 use crate::fs::invalid;
 use crate::sign::{self, Key};
-use crate::{br, extract, factory, ota, payload, sdat};
+use crate::{br, extract, factory, ota, payload, sdat, superrom};
 
 const STATE: &str = "jancox_rom";
 const OP_LIST: &str = "dynamic_partitions_op_list";
@@ -111,18 +111,21 @@ pub struct Partition {
     pub fs: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Format {
     /// `<part>.transfer.list` + `<part>.new.dat[.br]`
+    #[default]
     Sdat,
     /// raw images in a fastboot `image-*.zip`
     Fastboot,
     /// A/B OTA `payload.bin`
     Payload,
+    /// logical partitions in a `super.img` (Xiaomi fastboot `.tgz`, zips)
+    Super,
 }
 
 /// What unpack found, for repack.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct State {
     pub format: Format,
     pub partitions: Vec<Partition>,
@@ -131,6 +134,11 @@ pub struct State {
     /// Payload ROMs: the entries of the ROM zip in their original order.
     pub image_zip: String,
     pub image_entries: Vec<String>,
+    /// Super ROMs: the archive type ("zip", "tgz", "tar"), whether
+    /// super.img was sparse, and (partition, liblp name) pairs.
+    pub container: String,
+    pub super_sparse: bool,
+    pub super_map: Vec<(String, String)>,
 }
 
 fn state_path(work: &Path) -> PathBuf {
@@ -148,8 +156,19 @@ fn write_state(work: &Path, input: &Path, state: &State) -> io::Result<()> {
         Format::Sdat => "sdat",
         Format::Fastboot => "fastboot",
         Format::Payload => "payload",
+        Format::Super => "super",
     };
     s.push_str(&format!("format={}\n", format));
+    if state.format == Format::Super {
+        s.push_str(&format!("container={}\n", state.container));
+        s.push_str(&format!("super_sparse={}\n", state.super_sparse));
+        let map: Vec<String> = state
+            .super_map
+            .iter()
+            .map(|(p, l)| format!("{}:{}", p, l))
+            .collect();
+        s.push_str(&format!("super_map={}\n", map.join(" ")));
+    }
     if state.format != Format::Sdat {
         s.push_str(&format!("image_zip={}\n", state.image_zip));
         s.push_str(&format!(
@@ -210,6 +229,7 @@ pub fn read_full_state(work: &Path) -> io::Result<Option<State>> {
         None | Some("sdat") => Format::Sdat,
         Some("fastboot") => Format::Fastboot,
         Some("payload") => Format::Payload,
+        Some("super") => Format::Super,
         Some(f) => return Err(invalid(format!("{}: unknown format {}", STATE, f))),
     };
     Ok(Some(State {
@@ -222,6 +242,17 @@ pub fn read_full_state(work: &Path) -> io::Result<Option<State>> {
                 v.split('\t')
                     .filter(|e| !e.is_empty())
                     .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        container: kv.get("container").unwrap_or(&"").to_string(),
+        super_sparse: kv.get("super_sparse") == Some(&"true"),
+        super_map: kv
+            .get("super_map")
+            .map(|v| {
+                v.split_whitespace()
+                    .filter_map(|e| e.split_once(':'))
+                    .map(|(p, l)| (p.to_string(), l.to_string()))
                     .collect()
             })
             .unwrap_or_default(),
@@ -318,22 +349,75 @@ pub fn load_config(work: &Path) -> io::Result<RepackOptions> {
     Ok(opts)
 }
 
-/// Looks for the ROM zip: `<work>/input/*.zip`, then `<work>/input.zip`.
-pub fn find_input(work: &Path) -> Option<PathBuf> {
-    if let Ok(dir) = fs::read_dir(work.join("input")) {
-        let mut zips: Vec<PathBuf> = dir
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("zip")))
-            .collect();
-        zips.sort();
-        if let Some(z) = zips.into_iter().next() {
-            return Some(z);
-        }
-    }
-    Some(work.join("input.zip")).filter(|p| p.is_file())
+/// File names a ROM can have: zip, tgz / tar.gz, tar, or a bare
+/// payload.bin.
+fn is_rom_name(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    [".zip", ".tgz", ".tar.gz", ".tar", ".bin"]
+        .iter()
+        .any(|e| n.ends_with(e))
 }
 
-fn zip_err(e: zip::result::ZipError) -> io::Error {
+/// Looks for the ROM: the first ROM file in `<work>/input/` (any name),
+/// then `<work>/input.{zip,tgz,tar.gz,tar}` or `<work>/payload.bin`.
+pub fn find_input(work: &Path) -> Option<PathBuf> {
+    if let Ok(dir) = fs::read_dir(work.join("input")) {
+        let mut roms: Vec<PathBuf> = dir
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.is_file())
+            .filter(|p| {
+                p.file_name()
+                    .is_some_and(|n| is_rom_name(&n.to_string_lossy()))
+            })
+            .collect();
+        // an archive before a stray .bin
+        roms.sort_by_key(|p| (p.extension().is_some_and(|e| e == "bin"), p.clone()));
+        if let Some(r) = roms.into_iter().next() {
+            return Some(r);
+        }
+    }
+    [
+        "input.zip",
+        "input.tgz",
+        "input.tar.gz",
+        "input.tar",
+        "payload.bin",
+    ]
+    .iter()
+    .map(|n| work.join(n))
+    .find(|p| p.is_file())
+}
+
+/// What a ROM file is, from its first bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Container {
+    Zip,
+    Tgz,
+    Tar,
+    Payload,
+}
+
+fn container_of(path: &Path) -> io::Result<Container> {
+    let mut head = vec![0u8; 512];
+    let n = read_up_to(&mut File::open(path)?, &mut head)?;
+    let head = &head[..n];
+    if head.starts_with(b"PK") {
+        Ok(Container::Zip)
+    } else if head.starts_with(&[0x1f, 0x8b]) {
+        Ok(Container::Tgz)
+    } else if head.starts_with(payload::MAGIC) {
+        Ok(Container::Payload)
+    } else if head.get(257..262) == Some(b"ustar") {
+        Ok(Container::Tar)
+    } else {
+        Err(invalid(format!(
+            "{}: not a zip, tgz, tar or payload.bin",
+            path.display()
+        )))
+    }
+}
+
+pub(crate) fn zip_err(e: zip::result::ZipError) -> io::Error {
     e.into()
 }
 
@@ -353,30 +437,59 @@ pub fn unpack(input: &Path, work: &Path, mut log: impl FnMut(&str)) -> io::Resul
             format!("{} is already unpacked; run cleanup first", work.display()),
         ));
     }
+    let container = container_of(input)
+        .map_err(|e| io::Error::new(e.kind(), format!("{}: {}", input.display(), e)))?;
+    let symlink_note = |log: &mut dyn FnMut(&str)| {
+        if !extract::symlinks_supported(work) {
+            log("[!] This partition/storage does not support symlinks (e.g. /sdcard).");
+            log("    Symlinks are kept in config/<part>_symlinks and put back on repack.");
+            log("    To see them as real symlinks, work in a folder like the Termux home (~).");
+        }
+    };
+    if container != Container::Zip {
+        log(&format!("- ROM: {}", input.display()));
+        fs::create_dir_all(work)?;
+        symlink_note(&mut log);
+        let (state, other_files) = match container {
+            Container::Payload => unpack_payload::<BufReader<File>>(
+                input,
+                None,
+                &[payload::ENTRY.to_string()],
+                work,
+                &mut log,
+            )?,
+            c => superrom::unpack_tar(input, c == Container::Tgz, work, &mut log)?,
+        };
+        write_state(work, input, &state)?;
+        return Ok(UnpackSummary {
+            rom_info: rom_info(work),
+            other_files,
+            partitions: state.partitions,
+        });
+    }
     let file = File::open(input)
         .map_err(|e| io::Error::new(e.kind(), format!("{}: {}", input.display(), e)))?;
     let mut zip = ZipArchive::new(BufReader::new(file)).map_err(zip_err)?;
     let names: Vec<String> = zip.file_names().map(str::to_string).collect();
     let has_payload = names.iter().any(|n| n == payload::ENTRY);
     let has_sdat = names.iter().any(|n| n.ends_with(".transfer.list"));
+    let has_super = names.iter().any(|n| superrom::is_super_entry(n));
     let image_zip = factory::find_image_zip(names.iter().map(String::as_str)).map(str::to_string);
     let is_image_zip = factory::is_image_zip(names.iter().map(String::as_str));
-    if !has_payload && !has_sdat && image_zip.is_none() && !is_image_zip {
+    if !has_payload && !has_sdat && !has_super && image_zip.is_none() && !is_image_zip {
         return Err(invalid(
-            "no payload.bin, no *.transfer.list + *.new.dat[.br] partitions and no fastboot image-*.zip in this zip",
+            "no payload.bin, no *.transfer.list + *.new.dat[.br] partitions, no super.img and no fastboot image-*.zip in this zip",
         ));
     }
     log(&format!("- ROM: {}", input.display()));
     fs::create_dir_all(work)?;
-    if !extract::symlinks_supported(work) {
-        log("[!] This partition/storage does not support symlinks (e.g. /sdcard).");
-        log("    Symlinks are kept in config/<part>_symlinks and put back on repack.");
-        log("    To see them as real symlinks, work in a folder like the Termux home (~).");
-    }
+    symlink_note(&mut log);
     let (state, other_files) = if has_payload {
-        unpack_payload(input, &mut zip, &names, work, &mut log)?
+        unpack_payload(input, Some(&mut zip), &names, work, &mut log)?
     } else if has_sdat {
         unpack_sdat(&mut zip, &names, work, &mut log)?
+    } else if has_super {
+        superrom::unpack_zip(&mut zip, &names, work, &mut log)?
     } else {
         unpack_fastboot(input, &mut zip, image_zip, work, &mut log)?
     };
@@ -390,7 +503,7 @@ pub fn unpack(input: &Path, work: &Path, mut log: impl FnMut(&str)) -> io::Resul
 
 /// Writes the entries of `zip` for which `keep` is true into `dir`.
 /// Returns the number of files written.
-fn extract_entries<R: Read + Seek>(
+pub(crate) fn extract_entries<R: Read + Seek>(
     zip: &mut ZipArchive<R>,
     dir: &Path,
     keep: impl Fn(&str) -> bool,
@@ -428,7 +541,7 @@ fn extract_entries<R: Read + Seek>(
     Ok(files)
 }
 
-fn log_extracted(sum: &extract::Summary, log: &mut impl FnMut(&str)) {
+pub(crate) fn log_extracted(sum: &extract::Summary, log: &mut impl FnMut(&str)) {
     for w in sum.warnings.iter().take(5) {
         log(&format!("  [warning] {}", w));
     }
@@ -525,6 +638,7 @@ fn unpack_sdat<R: Read + Seek>(
         partitions: parts,
         image_zip: String::new(),
         image_entries: Vec::new(),
+        ..State::default()
     };
     Ok((state, other_files))
 }
@@ -676,6 +790,7 @@ fn unpack_fastboot<R: Read + Seek>(
         partitions: parts,
         image_zip: image_zip.unwrap_or_default(),
         image_entries: entries,
+        ..State::default()
     };
     Ok((state, other_files + others))
 }
@@ -698,17 +813,25 @@ const PAYLOAD_FS_PARTS: &[&str] = &[
 
 fn unpack_payload<R: Read + Seek>(
     input: &Path,
-    zip: &mut ZipArchive<R>,
+    mut zip: Option<&mut ZipArchive<R>>,
     names: &[String],
     work: &Path,
     log: &mut impl FnMut(&str),
 ) -> io::Result<(State, usize)> {
-    let index = zip
-        .index_for_name(payload::ENTRY)
-        .ok_or_else(|| invalid("payload.bin not found"))?;
-    let (start, len) = factory::stored_range(zip, index)?.ok_or_else(|| {
-        invalid("payload.bin is compressed inside the ROM zip; extract it and zip it stored")
-    })?;
+    // in an OTA zip (stored), or a bare payload.bin
+    let (start, len) = match zip.as_deref_mut() {
+        Some(zip) => {
+            let index = zip
+                .index_for_name(payload::ENTRY)
+                .ok_or_else(|| invalid("payload.bin not found"))?;
+            factory::stored_range(zip, index)?.ok_or_else(|| {
+                invalid(
+                    "payload.bin is compressed inside the ROM zip; extract it and zip it stored",
+                )
+            })?
+        }
+        None => (0, fs::metadata(input)?.len()),
+    };
     let mut reader = factory::open_window(input, start, len)?;
     let info = payload::Payload::read(&mut reader)?;
     let m = &info.manifest;
@@ -723,7 +846,11 @@ fn unpack_payload<R: Read + Seek>(
     ));
 
     let rom_dir = work.join("rom");
-    let other_files = extract_entries(zip, &rom_dir, |n| n != payload::ENTRY, log)?;
+    let other_files = match zip {
+        Some(zip) => extract_entries(zip, &rom_dir, |n| n != payload::ENTRY, log)?,
+        None => 0,
+    };
+    fs::create_dir_all(&rom_dir)?;
     log(&format!(
         "- Extracted {} other files to {}",
         other_files,
@@ -818,11 +945,12 @@ fn unpack_payload<R: Read + Seek>(
         partitions: parts,
         image_zip: String::new(),
         image_entries: names.to_vec(),
+        ..State::default()
     };
     Ok((state, other_files + kept.len()))
 }
 
-fn read_up_to(r: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
+pub(crate) fn read_up_to(r: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
     let mut n = 0;
     while n < buf.len() {
         match r.read(&mut buf[n..])? {
@@ -833,7 +961,7 @@ fn read_up_to(r: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
     Ok(n)
 }
 
-fn prop(path: &Path, key: &str) -> Option<String> {
+pub(crate) fn prop(path: &Path, key: &str) -> Option<String> {
     let text = fs::read_to_string(path).ok()?;
     text.lines()
         .find_map(|l| l.strip_prefix(key)?.strip_prefix('=').map(str::to_string))
@@ -969,15 +1097,18 @@ pub fn repack(
     let tmp = work.join("tmp");
     fs::create_dir_all(&tmp)?;
 
-    if state.format == Format::Payload {
-        let result = repack_payload(work, &state, &out_path, &tmp, &opts, &mut log);
+    if matches!(state.format, Format::Payload | Format::Super) {
+        let result = match state.format {
+            Format::Payload => repack_payload(work, &state, &out_path, &tmp, &opts, &mut log),
+            _ => superrom::repack(work, &state, &out_path, &tmp, &opts, &mut log),
+        };
         let _ = fs::remove_dir_all(&tmp);
         return result;
     }
     let result = match state.format {
         Format::Sdat => repack_sdat(work, &state.partitions, &partial, &tmp, &opts, &mut log),
         Format::Fastboot => repack_fastboot(work, &state, &partial, &tmp, &opts, &mut log),
-        Format::Payload => unreachable!(),
+        _ => unreachable!(),
     };
     let _ = fs::remove_dir_all(&tmp);
     match result {
@@ -992,7 +1123,7 @@ pub fn repack(
     }
 }
 
-fn zip_options(opts: &RepackOptions) -> (SimpleFileOptions, SimpleFileOptions) {
+pub(crate) fn zip_options(opts: &RepackOptions) -> (SimpleFileOptions, SimpleFileOptions) {
     let deflate = SimpleFileOptions::default()
         .compression_method(CompressionMethod::Deflated)
         .compression_level(Some(opts.zip_level))
@@ -1004,7 +1135,7 @@ fn zip_options(opts: &RepackOptions) -> (SimpleFileOptions, SimpleFileOptions) {
 }
 
 /// Copies a file into the zip, keeping its executable bit.
-fn add_file<W: Write + Seek>(
+pub(crate) fn add_file<W: Write + Seek>(
     zip: &mut ZipWriter<W>,
     name: &str,
     path: &Path,
@@ -1276,7 +1407,7 @@ fn repack_fastboot(
 
 /// A "doesn't fit" error with the likely reason when the original images
 /// were compressed EROFS: jancox rebuilds them uncompressed for now.
-fn compressed_hint(e: io::Error, work: &Path, parts: &[Partition]) -> io::Error {
+pub(crate) fn compressed_hint(e: io::Error, work: &Path, parts: &[Partition]) -> io::Error {
     if e.kind() != io::ErrorKind::StorageFull {
         return e;
     }
@@ -1750,7 +1881,7 @@ fn write_payload_fastboot(
     Ok(())
 }
 
-fn is_executable(meta: &fs::Metadata) -> bool {
+pub(crate) fn is_executable(meta: &fs::Metadata) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1764,7 +1895,11 @@ fn is_executable(meta: &fs::Metadata) -> bool {
 }
 
 /// Files under `dir` as (zip path with "/", path), sorted.
-fn collect_files(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) -> io::Result<()> {
+pub(crate) fn collect_files(
+    root: &Path,
+    dir: &Path,
+    out: &mut Vec<(String, PathBuf)>,
+) -> io::Result<()> {
     let mut entries: Vec<_> = fs::read_dir(dir)?.collect::<io::Result<_>>()?;
     entries.sort_by_key(|e| e.file_name());
     for e in entries {
@@ -1788,7 +1923,7 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) -> i
 /// Removes what unpack and repack created in `work`. `input/` is never
 /// touched; `output/` only with `all`. Returns the removed paths.
 pub fn cleanup(work: &Path, all: bool) -> io::Result<Vec<PathBuf>> {
-    let mut targets: Vec<PathBuf> = ["rom", "tmp", "partition"]
+    let mut targets: Vec<PathBuf> = ["rom", "tmp", "partition", "super"]
         .iter()
         .map(|d| work.join(d))
         .collect();

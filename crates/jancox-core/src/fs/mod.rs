@@ -115,6 +115,72 @@ impl<R: Read + Seek> Seek for Window<R> {
     }
 }
 
+/// Pieces of `inner` one after another as one reader: each is (length,
+/// Some(offset in `inner`)) or (length, None) for zeros. A logical
+/// partition in `super.img` reads this way.
+pub struct Segments<R> {
+    inner: R,
+    /// (logical start, length, offset in `inner`)
+    segs: Vec<(u64, u64, Option<u64>)>,
+    size: u64,
+    pos: u64,
+}
+
+impl<R: Read + Seek> Segments<R> {
+    pub fn new(inner: R, pieces: &[(u64, Option<u64>)]) -> Self {
+        let mut segs = Vec::with_capacity(pieces.len());
+        let mut at = 0;
+        for &(len, off) in pieces.iter().filter(|p| p.0 > 0) {
+            segs.push((at, len, off));
+            at += len;
+        }
+        Segments {
+            inner,
+            segs,
+            size: at,
+            pos: 0,
+        }
+    }
+
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+}
+
+impl<R: Read + Seek> Read for Segments<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() || self.pos >= self.size {
+            return Ok(0);
+        }
+        let i = self.segs.partition_point(|s| s.0 + s.1 <= self.pos);
+        let (start, len, off) = self.segs[i];
+        let within = self.pos - start;
+        let n = (buf.len() as u64).min(len - within) as usize;
+        match off {
+            Some(off) => {
+                self.inner.seek(SeekFrom::Start(off + within))?;
+                self.inner.read_exact(&mut buf[..n])?;
+            }
+            None => buf[..n].fill(0),
+        }
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl<R: Read + Seek> Seek for Segments<R> {
+    fn seek(&mut self, to: SeekFrom) -> io::Result<u64> {
+        let pos = match to {
+            SeekFrom::Start(p) => Some(p),
+            SeekFrom::End(d) => self.size.checked_add_signed(d),
+            SeekFrom::Current(d) => self.pos.checked_add_signed(d),
+        }
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "seek before start"))?;
+        self.pos = pos;
+        Ok(pos)
+    }
+}
+
 pub(crate) fn invalid(msg: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.into())
 }

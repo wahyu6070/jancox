@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process;
 use std::time::Instant;
 
-use jancox_core::{br, build, dat, extract, img2sdat, payload, rom, sdat};
+use jancox_core::{br, build, dat, extract, img2sdat, lp, payload, rom, sdat};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -52,6 +52,11 @@ fn usage() {
     out!("  payload <payload.bin|ota.zip> [-o outdir] [-p name,...] [-l] [-t threads]");
     out!("      Dump the partition images of a full A/B OTA payload to <outdir>/<name>.img");
     out!("      (default: -o . and all partitions; -l only lists them)");
+    out!("  super <super.img> [-o outdir] [-p name,...] [-l] [-s slot]");
+    out!(
+        "      Dump the logical partitions of a super image (raw or sparse) to <outdir>/<name>.img"
+    );
+    out!("      (default: -o . -s 0, all partitions with data; -l only lists them)");
     out!("  build <workdir> <part> [-o image] [-s size|auto] [-f]");
     out!("      Build an ext4 or EROFS image (fs_type in <part>_info) from <workdir>/<part>/");
     out!("      and <workdir>/config/<part>_*");
@@ -335,6 +340,80 @@ fn payload(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn super_img(args: &[String]) -> Result<(), String> {
+    const USAGE: &str = "usage: jancox super <super.img> [-o outdir] [-p name,...] [-l] [-s slot]";
+    let (mut input, mut out_dir, mut names, mut list, mut slot) =
+        (None, PathBuf::from("."), None, false, 0u32);
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        let mut value = || {
+            it.next()
+                .cloned()
+                .ok_or_else(|| format!("{} needs a value\n{}", arg, USAGE))
+        };
+        match arg.as_str() {
+            "-o" | "--outdir" => out_dir = PathBuf::from(value()?),
+            "-p" | "--part" => {
+                names = Some(value()?.split(',').map(str::to_string).collect::<Vec<_>>())
+            }
+            "-l" | "--list" => list = true,
+            "-s" | "--slot" => slot = value()?.parse().map_err(|_| USAGE.to_string())?,
+            _ if input.is_none() && !arg.starts_with('-') => input = Some(PathBuf::from(arg)),
+            _ => return Err(format!("unexpected argument: {}\n{}", arg, USAGE)),
+        }
+    }
+    let input = input.ok_or(USAGE)?;
+    let fail = |e: io::Error| format!("super failed: {}", e);
+    let file = fs::File::open(&input).map_err(|e| format!("{}: {}", input.display(), e))?;
+    let mut img = lp::SuperReader::open(io::BufReader::new(file)).map_err(fail)?;
+    let m = lp::read_super(&mut img, slot).map_err(fail)?;
+    if list {
+        out!(
+            "- super: {} bytes, {} metadata slots, {}",
+            m.super_size(),
+            m.geometry.slot_count,
+            if img.is_sparse() { "sparse" } else { "raw" }
+        );
+        for g in &m.groups {
+            out!("- group {} ({} bytes)", g.name, g.max_size);
+        }
+        for p in &m.partitions {
+            out!(
+                "{:<24} {:>12} bytes  group {}",
+                p.name,
+                p.size(),
+                m.groups[p.group as usize].name
+            );
+        }
+        return Ok(());
+    }
+    let parts: Vec<&lp::Partition> = match &names {
+        None => m.partitions.iter().filter(|p| p.size() > 0).collect(),
+        Some(names) => names
+            .iter()
+            .map(|n| {
+                m.partition(n)
+                    .ok_or_else(|| format!("no partition {} in the super image", n))
+            })
+            .collect::<Result<_, _>>()?,
+    };
+    fs::create_dir_all(&out_dir).map_err(|e| format!("{}: {}", out_dir.display(), e))?;
+    let start = Instant::now();
+    for p in parts {
+        let path = out_dir.join(format!("{}.img", p.name));
+        out!("- {}: {} MiB -> {}", p.name, p.size() >> 20, path.display());
+        let segs = m.segments(p).map_err(fail)?;
+        let mut src = jancox_core::fs::Segments::new(&mut img, &segs);
+        let mut dst = io::BufWriter::new(
+            fs::File::create(&path).map_err(|e| format!("{}: {}", path.display(), e))?,
+        );
+        io::copy(&mut src, &mut dst).map_err(fail)?;
+        dst.flush().map_err(fail)?;
+    }
+    out!("- Done in {:.1}s", start.elapsed().as_secs_f64());
+    Ok(())
+}
+
 fn build(args: &[String]) -> Result<(), String> {
     const USAGE: &str = "usage: jancox build <workdir> <part> [-o image] [-s size|auto] [-f]";
     let mut positional = Vec::new();
@@ -556,6 +635,7 @@ fn main() {
         Some("extract") => extract(&args[1..]),
         Some("build") => build(&args[1..]),
         Some("payload") => payload(&args[1..]),
+        Some("super") => super_img(&args[1..]),
         Some("-V" | "--version" | "version") => {
             out!("jancox {}", VERSION);
             Ok(())

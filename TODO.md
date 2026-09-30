@@ -22,7 +22,7 @@ Most payload ROMs from Xiaomi, OnePlus and others ship lz4 EROFS: they unpack (R
 ### Open points
 
 - Incremental OTAs (SOURCE_COPY, SOURCE_BSDIFF, BROTLI_BSDIFF, PUFFDIFF, ZUCCHINI, LZ4DIFF_*) are refused; they need the old images.
-- A bare `payload.bin` works with `jancox payload`, but `unpack` only takes zips.
+- A bare `payload.bin` unpacks, but its repacked OTA zip has no `META-INF/com/android/metadata` (the original zip's is needed).
 - The logical partitions are dumped to `tmp/` before extraction, which needs their size in free space (system is 3.4 GB on the ROG Phone 5). Reading them in place would need a reader over the operations.
 - Only an ASUS payload was tested (REPLACE, REPLACE_XZ, REPLACE_BZ). ZSTD is covered by the decoder but untested on a real ROM.
 - Repack rebuilds every logical partition even when unchanged (like fastboot ROMs); an untouched partition could keep its old operations and hashtree.
@@ -54,11 +54,14 @@ AOSP (Apache-2.0), easiest to browse on cs.android.com:
 
 ## super.img
 
-The super partition image with all logical partitions (in some fastboot ROMs, and dumped from devices).
+Done: `lp.rs`, `sparse.rs`, `superrom.rs`, `jancox super`. Checked with the POCO F4 (munch) Xiaomi fastboot ROM: unpack matches the same version's payload OTA, and the repacked super.img passes `simg2img`, an independent liblp parse, `e2fsck` and a round trip; the CRC lists match Xiaomi's own script.
 
-- Read the liblp metadata (geometry, header, partitions, extents, groups; `factory::super_groups` already reads groups from `super_empty.img`). Sparse `super.img` needs the sparse reader first (see the ext4 extractor points below).
-- Unpack: extract each partition of slot a (`system_a`, ...) by its extents, straight from `super.img` through `fs::Window` when it is one linear extent.
-- Repack: write a new `super.img` (lpmake-like) from the rebuilt images, with the same groups, block devices and metadata size/slots, as raw or sparse.
+- Not flashed on a device yet.
+- Split super images (`super.img.0`, `super_1.img`, ... in some OEM ROMs) and `super.img.zst` (newer Xiaomi) aren't read.
+- Only the first block device (`super`) is supported; retrofit devices with super spread over system/vendor aren't.
+- Older Xiaomi fastboot ROMs without super.img (raw `system.img`, ...) are refused.
+- A repacked super.img always gets new extents for every partition; unchanged partitions could keep their place.
+- The archive is written with gzip level `zip.level` on one thread; `.tgz` output takes most of the repack time.
 
 ## Repack
 

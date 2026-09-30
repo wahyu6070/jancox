@@ -4,6 +4,9 @@
 - Fastboot ROMs: Pixel factory images (`<device>-<build>/image-*.zip`) and plain `image-*.zip` unpack and repack. The logical partitions from `super_empty.img` are read straight out of the zip; repack checks the super group size and disables dm-verity/verification in `vbmeta.img`
 - payload.bin ROMs (A/B OTA zips, full OTAs): unpack dumps the images straight from the zip (REPLACE, REPLACE_XZ, REPLACE_BZ, ZSTD, ZERO; decoded in parallel, SHA-256 checked) and extracts the logical partitions; the other images go to `rom/payload/`
 - New command: `jancox payload` dumps the images of a payload.bin or OTA zip
+- super.img ROMs: Xiaomi fastboot `.tgz` ROMs and zips with a `super.img` (raw or sparse) unpack and repack. The logical partitions are read straight out of the (sparse) super image; repack writes a new super.img with the same metadata, patches vbmeta, and renews Xiaomi's `crclist.txt` / `sparsecrclist.txt` so `flash_all` still passes the bootloader's CRC check
+- New command: `jancox super` lists and dumps the partitions of a super image
+- Input: any zip, `.tgz`, `.tar.gz`, `.tar` or bare `payload.bin` in `input/` is found by its content, whatever its name; `input.zip`/`.tgz`/`.tar.gz`/`.tar` and `payload.bin` in the work folder too
 - payload.bin ROMs repack: a new OTA zip (signed payload.bin with the AOSP test key or your own, payload_properties.txt, metadata with new property files, whole-zip signature) and/or a fastboot ROM with flash-all.sh/.bat. Pick with `payload.output=payload|fastboot|both` in `jancox.prop` (default payload) or `repack -t`. Unchanged images are copied from the old payload; vbmeta gets the disable-verity flags
 - ext4: images with `shared_blocks` (Android 10+ block sharing) are rebuilt with it, so an unchanged partition keeps its size
 - ext4: a rebuild at the original size keeps the original inode count

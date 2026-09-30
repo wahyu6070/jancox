@@ -7,7 +7,8 @@ Jancox is one `jancox` binary, written in Rust, with no dependencies. Unpacking 
 - Unpack a ROM zip into folders you can edit:
   - recovery ROMs (`*.new.dat.br` / `*.new.dat` + `*.transfer.list`)
   - fastboot ROMs such as Pixel factory images (`<device>-<build>/image-*.zip`, flashed with `flash-all.sh`), or an `image-*.zip` on its own
-  - A/B OTA zips with `payload.bin` (full OTAs), repacked as a new signed OTA zip and/or a fastboot ROM
+  - A/B OTA zips with `payload.bin` (full OTAs, or a bare `payload.bin`), repacked as a new signed OTA zip and/or a fastboot ROM
+  - ROMs with a `super.img` (raw or sparse): Xiaomi fastboot ROMs (`<device>_images_<version>.tgz`) and zips
 - ext4 and EROFS partitions.
 - Repack the folders into a new ROM zip of the same kind.
 - Keeps owners, permissions, SELinux labels and capabilities in metadata files, so it works on `/sdcard` and on Windows too.
@@ -79,7 +80,7 @@ Get the zips from [Releases](https://github.com/wahyu6070/jancox/releases).
 `jancox` works in the folder you run it from (or the folder given with `-w`).
 
 1. `jancox init` makes `input/`, `output/` and `jancox.prop` (optional; `unpack` does it too when no ROM is found).
-2. Put the ROM zip in `input/`.
+2. Put the ROM in `input/`: a zip, `.tgz` / `.tar.gz`, `.tar` or a bare `payload.bin`, with any name. Without `input/`, `input.zip`, `input.tgz`, `input.tar.gz`, `input.tar` or `payload.bin` in the work folder are used.
 3. `jancox unpack`
 4. Edit the files in `partition/system/`, `partition/vendor/`, `partition/product/`, ...
 5. `jancox repack`. The new ROM is written to `output/NewROM-<date>.zip`.
@@ -135,6 +136,17 @@ Full OTA zips with a `payload.bin` (e.g. ASUS, Xiaomi, OnePlus stock ROMs) unpac
 
 `jancox payload ota.zip -o images/` only dumps the images (like payload-dumper); `-p boot,vendor_boot` picks some, `-l` lists them.
 
+### Xiaomi fastboot ROMs (super.img)
+
+Put the fastboot ROM (e.g. `munch_global_images_V14.0.6.0.TLMMIXM_..._13.0_global_418d21cc7e.tgz`) in `input/` and run `jancox unpack`.
+
+- The archive is unpacked to `rom/`, except `images/super.img`: its ext4/EROFS partitions (slot a) go to `partition/`, its metadata and any other logical partition to `super/`. The sparse super.img is read in place, without a raw copy.
+- `jancox repack` rebuilds the partitions, writes a new `super.img` with the same groups and size (sparse again), sets the disable-verity flags in `vbmeta.img`, and writes `output/NewROM-<date>.tgz` with the original files in their original order.
+- Xiaomi's `flash_all.sh` flashes `images/crclist.txt` and `images/sparsecrclist.txt` first, and the bootloader refuses images that don't match them. Repack computes new lines for `super` and `vbmeta_ab` the way the ROM's own `flash_gen_crc_list.py` does.
+- Flash with `flash_all.sh` / `flash_all.bat` on an unlocked device (they wipe data; `flash_all_except_storage` keeps it).
+
+`jancox super super.img -o images/` only dumps the partitions of a super image (raw or sparse, like lpunpack); `-l` lists them.
+
 ### Commands
 
 ```
@@ -145,6 +157,7 @@ jancox cleanup  [-w workdir] [--all]
 
 jancox extract  <image> [-o outdir] [-p name]           ext4/EROFS image -> folder + metadata
 jancox payload  <payload.bin|ota.zip> [-o outdir] [-p name,...] [-l]  payload -> images
+jancox super    <super.img> [-o outdir] [-p name,...] [-l] [-s slot]   super.img -> images
 jancox build    <workdir> <part> [-o image] [-s size|auto]  folder + metadata -> ext4/EROFS image
 jancox sdat2img <transfer_list> <new_dat[.br]> [image]
 jancox img2sdat <image> [-o outdir] [-v version] [-p prefix] [-b quality]
@@ -156,7 +169,8 @@ jancox brotli   [-d] [-q quality] [-w window] [-o output] <file>
 ## Limitations
 
 - EROFS images are read with any compression (lz4, lzma, deflate, zstd), but rebuilt without compression. A ROM whose partitions were compressed EROFS (most Xiaomi, OnePlus, ... ROMs) usually doesn't fit its super partition when repacked; repack says so.
-- Incremental OTAs (payload.bin patches) are refused. `super.img` is not supported yet.
+- Incremental OTAs (payload.bin patches) are refused.
+- Older Xiaomi fastboot ROMs without `super.img` (separate `system.img`, ...) are not supported.
 - A repacked partition no longer matches its dm-verity hashtree / AVB data, so the ROM only boots with verification disabled (as with older Jancox versions). For fastboot ROMs, repack sets the "disable verity + verification" flags in `vbmeta.img`; this needs an unlocked bootloader, and the first flash with these flags needs a data wipe (`flash-all.sh` wipes by default).
 - Paths with spaces can't be stored in `fs_config` and get a warning.
 - Hard links become separate files.
