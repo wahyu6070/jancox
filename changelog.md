@@ -6,6 +6,7 @@
 - New command: `jancox payload` dumps the images of a payload.bin or OTA zip
 - super.img ROMs: Xiaomi fastboot `.tgz` ROMs and zips with a `super.img` (raw or sparse) unpack and repack. The logical partitions are read straight out of the (sparse) super image; repack writes a new super.img with the same metadata, patches vbmeta, and renews Xiaomi's `crclist.txt` / `sparsecrclist.txt` so `flash_all` still passes the bootloader's CRC check
 - New command: `jancox super` lists and dumps the partitions of a super image
+- `output.format` in `jancox.prop` (or `repack -t`, a list): `auto` (default, like the input), `fastboot` (images + flash-all.sh/.bat from any ROM, e.g. a recovery ROM), `sdat`, `payload`, `super`; formats a ROM can't become are refused with the reason
 - Input: any zip, `.tgz`, `.tar.gz`, `.tar` or bare `payload.bin` in `input/` is found by its content, whatever its name; `input.zip`/`.tgz`/`.tar.gz`/`.tar` and `payload.bin` in the work folder too
 - payload.bin ROMs repack: a new OTA zip (signed payload.bin with the AOSP test key or your own, payload_properties.txt, metadata with new property files, whole-zip signature) and/or a fastboot ROM with flash-all.sh/.bat. Pick with `payload.output=payload|fastboot|both` in `jancox.prop` (default payload) or `repack -t`. Unchanged images are copied from the old payload; vbmeta gets the disable-verity flags
 - ext4: images with `shared_blocks` (Android 10+ block sharing) are rebuilt with it, so an unchanged partition keeps its size

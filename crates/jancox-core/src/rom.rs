@@ -44,7 +44,11 @@ pub struct RepackOptions {
     pub brotli_quality: u32,
     /// Deflate level (0-9) for the other files in the zip.
     pub zip_level: i64,
-    /// payload.bin ROMs: which zips repack makes.
+    /// What repack makes (`output.format`): the input's own format
+    /// (`Auto`) or others, one zip each.
+    pub output: Vec<Target>,
+    /// payload.bin ROMs with `output.format=auto`: which zips repack makes
+    /// (`payload.output`, kept from before `output.format`).
     pub payload_output: PayloadOutput,
     /// xz preset (0-9) for rebuilt images in a new payload.bin.
     pub xz_level: u32,
@@ -59,10 +63,61 @@ impl Default for RepackOptions {
         RepackOptions {
             brotli_quality: br::DEFAULT_QUALITY,
             zip_level: 1,
+            output: vec![Target::Auto],
             payload_output: PayloadOutput::Payload,
             xz_level: 1,
             sign_key: None,
             sign_cert: None,
+        }
+    }
+}
+
+/// An output format of `repack`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Target {
+    /// The same kind of ROM as the input.
+    Auto,
+    /// `*.new.dat[.br]` recovery ROM (from a recovery ROM only).
+    Sdat,
+    /// Images + flash-all.sh / flash-all.bat.
+    Fastboot,
+    /// A/B OTA zip with payload.bin (from a payload ROM only).
+    Payload,
+    /// super.img ROM (from a super ROM only).
+    Super,
+}
+
+impl Target {
+    pub fn parse(s: &str) -> Option<Target> {
+        Some(match s.trim() {
+            "auto" => Target::Auto,
+            "sdat" => Target::Sdat,
+            "fastboot" => Target::Fastboot,
+            "payload" => Target::Payload,
+            "super" => Target::Super,
+            _ => return None,
+        })
+    }
+
+    /// A list like `payload,fastboot` (`both` = payload + fastboot).
+    pub fn parse_list(s: &str) -> Option<Vec<Target>> {
+        let mut out = Vec::new();
+        for t in s.split(',').filter(|t| !t.trim().is_empty()) {
+            match t.trim() {
+                "both" => out.extend([Target::Payload, Target::Fastboot]),
+                t => out.push(Target::parse(t)?),
+            }
+        }
+        (!out.is_empty()).then_some(out)
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Target::Auto => "auto",
+            Target::Sdat => "sdat",
+            Target::Fastboot => "fastboot",
+            Target::Payload => "payload",
+            Target::Super => "super",
         }
     }
 }
@@ -271,10 +326,16 @@ brotli.level=1
 # deflate level for the other files in the ROM zip: 0 (store) - 9 (smallest)
 zip.level=1
 
-# payload.bin (A/B OTA) ROMs: what repack makes
-#   payload  = a new OTA zip with payload.bin (custom recovery or adb sideload)
-#   fastboot = the images with flash-all.sh / flash-all.bat (fastboot)
-#   both     = both zips
+# what repack makes, one zip per format (a list like payload,fastboot):
+#   auto     = the same kind of ROM as the input (default)
+#   fastboot = the images with flash-all.sh / flash-all.bat (any ROM;
+#              a Pixel or Xiaomi fastboot ROM stays as it is)
+#   sdat     = *.new.dat[.br] recovery ROM (from a recovery ROM)
+#   payload  = OTA zip with payload.bin (from a payload.bin ROM)
+#   super    = super.img ROM (from a super.img ROM)
+output.format=auto
+
+# payload.bin ROMs with output.format=auto: payload, fastboot or both
 payload.output=payload
 
 # xz level for rebuilt partitions in payload.bin: 0 (fastest) - 9 (smallest)
@@ -337,6 +398,7 @@ pub fn load_config(work: &Path) -> io::Result<RepackOptions> {
             "payload.output" => {
                 opts.payload_output = PayloadOutput::parse(value).ok_or_else(bad)?
             }
+            "output.format" => opts.output = Target::parse_list(value).ok_or_else(bad)?,
             "payload.xz_level" => {
                 opts.xz_level = value.parse().ok().filter(|l| *l <= 9).ok_or_else(bad)?
             }
@@ -1097,30 +1159,125 @@ pub fn repack(
     let tmp = work.join("tmp");
     fs::create_dir_all(&tmp)?;
 
-    if matches!(state.format, Format::Payload | Format::Super) {
-        let result = match state.format {
-            Format::Payload => repack_payload(work, &state, &out_path, &tmp, &opts, &mut log),
-            _ => superrom::repack(work, &state, &out_path, &tmp, &opts, &mut log),
+    let targets = resolve_targets(state.format, &opts)?;
+    let mut opts = opts;
+    if state.format == Format::Payload {
+        opts.payload_output = match (
+            targets.contains(&Target::Payload),
+            targets.contains(&Target::Fastboot),
+        ) {
+            (true, true) => PayloadOutput::Both,
+            (false, true) => PayloadOutput::Fastboot,
+            _ => PayloadOutput::Payload,
         };
-        let _ = fs::remove_dir_all(&tmp);
-        return result;
     }
     let result = match state.format {
-        Format::Sdat => repack_sdat(work, &state.partitions, &partial, &tmp, &opts, &mut log),
-        Format::Fastboot => repack_fastboot(work, &state, &partial, &tmp, &opts, &mut log),
-        _ => unreachable!(),
+        Format::Payload => repack_payload(work, &state, &out_path, &tmp, &opts, &mut log),
+        Format::Super => superrom::repack(work, &state, &out_path, &tmp, &opts, &mut log),
+        Format::Fastboot => finish_one(
+            repack_fastboot(work, &state, &partial, &tmp, &opts, &mut log),
+            &partial,
+            &out_path,
+        ),
+        Format::Sdat => {
+            let mut written = Vec::new();
+            let both = targets.len() > 1;
+            let mut result = Ok(());
+            for t in &targets {
+                let out = match t {
+                    Target::Fastboot if both => suffixed(&out_path, "fastboot"),
+                    _ => out_path.clone(),
+                };
+                let partial = out.with_extension("zip.part");
+                let r = match t {
+                    Target::Fastboot => {
+                        repack_sdat_fastboot(work, &state, &partial, &tmp, &opts, &mut log)
+                    }
+                    _ => repack_sdat(work, &state.partitions, &partial, &tmp, &opts, &mut log),
+                };
+                match finish_one(r, &partial, &out) {
+                    Ok(mut w) => written.append(&mut w),
+                    Err(e) => {
+                        result = Err(e);
+                        break;
+                    }
+                }
+            }
+            result.map(|()| written)
+        }
     };
     let _ = fs::remove_dir_all(&tmp);
+    result
+}
+
+/// Renames a finished zip into place, or removes it after an error.
+fn finish_one(result: io::Result<()>, partial: &Path, out: &Path) -> io::Result<Vec<PathBuf>> {
     match result {
         Ok(()) => {
-            fs::rename(&partial, &out_path)?;
-            Ok(vec![out_path])
+            fs::rename(partial, out)?;
+            Ok(vec![out.to_path_buf()])
         }
         Err(e) => {
-            let _ = fs::remove_file(&partial);
+            let _ = fs::remove_file(partial);
             Err(e)
         }
     }
+}
+
+/// `NewROM-x.zip` -> `NewROM-x-<tag>.zip`
+fn suffixed(path: &Path, tag: &str) -> PathBuf {
+    let stem = path
+        .file_stem()
+        .map_or("NewROM".into(), |s| s.to_string_lossy().into_owned());
+    path.with_file_name(format!("{}-{}.zip", stem, tag))
+}
+
+/// The outputs `repack` makes for a ROM of `format`: `auto` becomes the
+/// input's own kind; formats a ROM can't become are refused.
+fn resolve_targets(format: Format, opts: &RepackOptions) -> io::Result<Vec<Target>> {
+    let input = match format {
+        Format::Sdat => "a recovery (sdat) ROM",
+        Format::Fastboot => "a Pixel fastboot ROM",
+        Format::Payload => "a payload.bin ROM",
+        Format::Super => "a super.img ROM",
+    };
+    let mut out: Vec<Target> = Vec::new();
+    for &t in &opts.output {
+        let t = match (format, t) {
+            (Format::Payload, Target::Auto) => match opts.payload_output {
+                PayloadOutput::Payload => Target::Payload,
+                PayloadOutput::Fastboot => Target::Fastboot,
+                PayloadOutput::Both => {
+                    out.push(Target::Payload);
+                    Target::Fastboot
+                }
+            },
+            (Format::Sdat, Target::Auto | Target::Sdat) => Target::Sdat,
+            (Format::Sdat, Target::Fastboot) => Target::Fastboot,
+            (Format::Payload, Target::Payload | Target::Fastboot) => t,
+            // already fastboot ROMs
+            (Format::Fastboot, Target::Auto | Target::Fastboot) => Target::Fastboot,
+            (Format::Super, Target::Auto | Target::Super | Target::Fastboot) => Target::Super,
+            (_, t) => {
+                let why = match t {
+                    Target::Sdat => "a recovery ROM needs the original updater-script and update-binary",
+                    Target::Payload => "payload.bin needs the manifest of an A/B OTA (partitions, groups, timestamps)",
+                    Target::Super => "super.img needs the super metadata (device size, groups) of a super.img ROM",
+                    _ => "not supported",
+                };
+                return Err(invalid(format!(
+                    "{} can't be repacked as {}: {}. Use output.format=auto or fastboot",
+                    input,
+                    t.name(),
+                    why
+                )));
+            }
+        };
+        if !out.contains(&t) {
+            out.push(t);
+        }
+    }
+    Ok(out)
 }
 
 pub(crate) fn zip_options(opts: &RepackOptions) -> (SimpleFileOptions, SimpleFileOptions) {
@@ -1853,18 +2010,36 @@ fn write_payload_fastboot(
     partial: &Path,
     log: &mut impl FnMut(&str),
 ) -> io::Result<()> {
-    let logical: std::collections::HashSet<&str> = m
+    let logical: std::collections::HashSet<String> = m
         .groups
         .iter()
         .flat_map(|g| &g.partitions)
-        .map(|p| factory::strip_slot(p))
+        .map(|p| factory::strip_slot(p).to_string())
         .collect();
-    let (logical_parts, firmware): (Vec<String>, Vec<String>) = m
+    let images: Vec<(String, PathBuf)> = m
         .partitions
         .iter()
-        .map(|p| p.name.clone())
-        .partition(|n| logical.contains(n.as_str()));
-    let (sh, bat) = ota::flash_scripts(&firmware, &logical_parts, m.snapshot_enabled);
+        .zip(sources)
+        .map(|(p, s)| (p.name.clone(), s.path().to_path_buf()))
+        .collect();
+    write_fastboot_zip(&images, &logical, m.snapshot_enabled, partial, log)
+}
+
+/// Writes a fastboot ROM: `<name>.img` for each image, and flash-all.sh /
+/// flash-all.bat flashing the `logical` ones in fastbootd and the rest in
+/// the bootloader.
+fn write_fastboot_zip(
+    images: &[(String, PathBuf)],
+    logical: &std::collections::HashSet<String>,
+    snapshot: bool,
+    partial: &Path,
+    log: &mut impl FnMut(&str),
+) -> io::Result<()> {
+    let (logical_parts, firmware): (Vec<String>, Vec<String>) = images
+        .iter()
+        .map(|(n, _)| n.clone())
+        .partition(|n| logical.contains(n));
+    let (sh, bat) = ota::flash_scripts(&firmware, &logical_parts, snapshot);
     let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
     let mut zip = ZipWriter::new(BufWriter::with_capacity(1 << 20, File::create(partial)?));
     zip.start_file("flash-all.sh", stored.unix_permissions(0o755))
@@ -1874,11 +2049,91 @@ fn write_payload_fastboot(
         .map_err(zip_err)?;
     zip.write_all(bat.as_bytes())?;
     log("- Writing the fastboot ROM (images + flash-all.sh/.bat)");
-    for (p, source) in m.partitions.iter().zip(sources) {
-        add_file(&mut zip, &format!("{}.img", p.name), source.path(), stored)?;
+    for (name, path) in images {
+        add_file(&mut zip, &format!("{}.img", name), path, stored)?;
     }
     zip.finish().map_err(zip_err)?.flush()?;
     Ok(())
+}
+
+/// A recovery (sdat) ROM as a fastboot ROM: the rebuilt partitions and the
+/// images at the root of the ROM (boot.img, dtbo.img, vbmeta.img, ...).
+/// With `dynamic_partitions_op_list` the partitions are logical ones and
+/// are flashed in fastbootd.
+fn repack_sdat_fastboot(
+    work: &Path,
+    state: &State,
+    partial: &Path,
+    tmp: &Path,
+    _opts: &RepackOptions,
+    log: &mut impl FnMut(&str),
+) -> io::Result<()> {
+    let rom_dir = work.join("rom");
+    let op_list = fs::read_to_string(rom_dir.join(OP_LIST)).ok();
+    let dynamic = op_list.is_some();
+    let parts_dir = partition_dir(work);
+    let mut images = Vec::new();
+    let mut logical = std::collections::HashSet::new();
+    for p in &state.partitions {
+        let img = tmp.join(format!("{}.img", p.name));
+        match build::build(&parts_dir, &p.name, &img, Size::Original, &mut *log) {
+            Err(e) if e.kind() == io::ErrorKind::StorageFull && dynamic => {
+                log(&format!(
+                    "- {} is full, growing it (dynamic partition)",
+                    p.name
+                ));
+                build::build(&parts_dir, &p.name, &img, Size::Auto, &mut *log)?;
+            }
+            other => {
+                other?;
+            }
+        }
+        if dynamic {
+            logical.insert(p.name.clone());
+        }
+        images.push((p.name.clone(), img));
+    }
+    if let Some(text) = &op_list {
+        // group limits still hold when fastbootd resizes the partitions
+        let mut sizes = BTreeMap::new();
+        for (n, img) in &images {
+            sizes.insert(n.clone(), fs::metadata(img)?.len());
+        }
+        update_op_list(text, &sizes).map_err(|e| {
+            compressed_hint(
+                io::Error::new(io::ErrorKind::StorageFull, e.to_string()),
+                work,
+                &state.partitions,
+            )
+        })?;
+    }
+    // images at the root of the ROM zip
+    let mut files: Vec<_> = fs::read_dir(&rom_dir)?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.is_file() && p.extension().is_some_and(|e| e == "img"))
+        .collect();
+    files.sort();
+    for f in files {
+        let name = f.file_stem().unwrap().to_string_lossy().into_owned();
+        if images.iter().any(|(n, _)| *n == name) {
+            continue;
+        }
+        if name == "vbmeta" {
+            let mut data = fs::read(&f)?;
+            if factory::disable_verification(&mut data)? {
+                log("- vbmeta.img: dm-verity and AVB verification disabled");
+                let p = tmp.join("vbmeta.img");
+                fs::write(&p, &data)?;
+                images.push((name, p));
+                continue;
+            }
+        }
+        images.push((name, f));
+    }
+    if rom_dir.join("firmware-update").is_dir() {
+        log("  [warning] firmware-update/ is left out: its images are flashed by the recovery script");
+    }
+    write_fastboot_zip(&images, &logical, false, partial, log)
 }
 
 pub(crate) fn is_executable(meta: &fs::Metadata) -> bool {
@@ -1964,6 +2219,37 @@ mod tests {
         add vendor qti\n\
         resize system 3000\n\
         resize vendor 1000\n";
+
+    #[test]
+    fn output_targets() {
+        let opts = |list: &str| RepackOptions {
+            output: Target::parse_list(list).unwrap(),
+            ..RepackOptions::default()
+        };
+        let r = |f, list: &str| resolve_targets(f, &opts(list));
+        assert_eq!(r(Format::Sdat, "auto").unwrap(), [Target::Sdat]);
+        assert_eq!(
+            r(Format::Sdat, "sdat,fastboot").unwrap(),
+            [Target::Sdat, Target::Fastboot]
+        );
+        assert!(r(Format::Sdat, "payload").is_err());
+        assert_eq!(
+            r(Format::Payload, "both").unwrap(),
+            [Target::Payload, Target::Fastboot]
+        );
+        assert_eq!(r(Format::Super, "fastboot,auto").unwrap(), [Target::Super]);
+        assert!(r(Format::Fastboot, "super").is_err());
+        // payload.output applies to auto
+        let o = RepackOptions {
+            payload_output: PayloadOutput::Both,
+            ..RepackOptions::default()
+        };
+        assert_eq!(
+            resolve_targets(Format::Payload, &o).unwrap(),
+            [Target::Payload, Target::Fastboot]
+        );
+        assert!(Target::parse_list("auto,nope").is_none());
+    }
 
     #[test]
     fn op_list_resize() {

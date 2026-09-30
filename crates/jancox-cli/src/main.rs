@@ -29,7 +29,9 @@ fn usage() {
     out!("      Unpack a ROM zip (default: <workdir>/input/*.zip or input.zip) into editable folders");
     out!("  repack [-w workdir] [-o out.zip] [-b brotli_quality] [-z zip_level] [-t type]");
     out!("      Build a new ROM zip in <workdir>/output/ (default: jancox.prop, else -b 1 -z 1)");
-    out!("      -t: what a payload.bin ROM becomes: payload (OTA zip), fastboot or both");
+    out!(
+        "      -t: output formats (auto = like the input; fastboot, sdat, payload, super; a list)"
+    );
     out!("  cleanup [-w workdir] [--all]");
     out!("      Remove the unpacked files (--all: also <workdir>/output); input/ is kept\n");
     out!("Tools:");
@@ -545,7 +547,7 @@ fn unpack(args: &[String]) -> Result<(), String> {
 
 fn repack(args: &[String]) -> Result<(), String> {
     const USAGE: &str =
-        "usage: jancox repack [-w workdir] [-o out.zip] [-b brotli_quality] [-z zip_level] [-t payload|fastboot|both]";
+        "usage: jancox repack [-w workdir] [-o out.zip] [-b brotli_quality] [-z zip_level] [-t auto|fastboot|sdat|payload|super,...]";
     let (work, rest) = workdir(args, USAGE)?;
     let mut opts = rom::load_config(&work).map_err(|e| format!("repack failed: {}", e))?;
     let mut output = None;
@@ -565,8 +567,7 @@ fn repack(args: &[String]) -> Result<(), String> {
                 opts.zip_level = value()?.parse().map_err(|_| USAGE.to_string())?
             }
             "-t" | "--type" => {
-                opts.payload_output =
-                    rom::PayloadOutput::parse(&value()?).ok_or_else(|| USAGE.to_string())?
+                opts.output = rom::Target::parse_list(&value()?).ok_or_else(|| USAGE.to_string())?
             }
             _ => return Err(format!("unexpected argument: {}\n{}", arg, USAGE)),
         }

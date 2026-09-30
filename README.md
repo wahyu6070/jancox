@@ -120,7 +120,7 @@ Full OTA zips with a `payload.bin` (e.g. ASUS, Xiaomi, OnePlus stock ROMs) unpac
 - The other images (boot, vendor_boot, dtbo, vbmeta, modem, bootloader, ...) go to `rom/payload/<name>.img`.
 - Every image is checked against the SHA-256 in the payload.
 
-`jancox repack` makes what `payload.output` in `jancox.prop` says (or `-t`):
+With `output.format=auto`, `jancox repack` makes what `payload.output` in `jancox.prop` says:
 
 | `payload.output` | Result |
 |---|---|
@@ -135,6 +135,19 @@ Full OTA zips with a `payload.bin` (e.g. ASUS, Xiaomi, OnePlus stock ROMs) unpac
 - Images made with block sharing (`shared_blocks`, most Android 10+ ext4 images) are rebuilt with it, so they keep their size.
 
 `jancox payload ota.zip -o images/` only dumps the images (like payload-dumper); `-p boot,vendor_boot` picks some, `-l` lists them.
+
+### Output format
+
+`output.format` in `jancox.prop` (or `repack -t`) picks what repack makes; a list like `sdat,fastboot` makes one zip each. Missing or `auto` means the same kind of ROM as the input.
+
+| Input \ `output.format` | `auto` | `fastboot` | `sdat` | `payload` | `super` |
+|---|---|---|---|---|---|
+| Recovery ROM (`*.new.dat[.br]`) | recovery ROM | images + `flash-all.sh/.bat` | ✅ | ❌ | ❌ |
+| payload.bin ROM | `payload.output` | images + `flash-all.sh/.bat` | ❌ | ✅ | ❌ |
+| Pixel factory ROM | factory ROM | (it is one) | ❌ | ❌ | ❌ |
+| Xiaomi fastboot / super.img ROM | same archive | (it is one) | ❌ | ❌ | ✅ |
+
+A generated fastboot ROM flashes the firmware and boot images in the bootloader and the logical (dynamic) partitions in fastbootd. The ❌ cases are refused with the reason: a recovery ROM needs the original updater-script, a payload the manifest of an A/B OTA, a super.img the super metadata of the device.
 
 ### Xiaomi fastboot ROMs (super.img)
 
@@ -152,7 +165,7 @@ Put the fastboot ROM (e.g. `munch_global_images_V14.0.6.0.TLMMIXM_..._13.0_globa
 ```
 jancox init     [-w workdir]
 jancox unpack   [rom.zip] [-w workdir]
-jancox repack   [-w workdir] [-o out.zip] [-b brotli_quality] [-z zip_level] [-t payload|fastboot|both]
+jancox repack   [-w workdir] [-o out.zip] [-b brotli_quality] [-z zip_level] [-t auto|fastboot|sdat|payload|super,...]
 jancox cleanup  [-w workdir] [--all]
 
 jancox extract  <image> [-o outdir] [-p name]           ext4/EROFS image -> folder + metadata
