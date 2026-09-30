@@ -13,6 +13,8 @@ Jancox is one `jancox` binary, written in Rust, with no dependencies. Unpacking 
 - Keeps owners, permissions, SELinux labels and capabilities in metadata files, so it works on `/sdcard` and on Windows too.
 - Grows full dynamic partitions and updates `dynamic_partitions_op_list`.
 
+Devices and ROMs it has been tested with: [device_tested.md](device_tested.md).
+
 ## Install
 
 ### Android (root: Magisk, KernelSU, APatch)
