@@ -6,6 +6,7 @@ pub mod dat;
 pub mod extract;
 pub mod factory;
 pub mod fs;
+pub mod lz4;
 pub mod ota;
 pub mod payload;
 pub mod proto;

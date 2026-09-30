@@ -10,6 +10,7 @@ repository = "https://github.com/wahyu6070/jancox"
 
 [workspace.dependencies]
 brotli = "9"
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 bzip2 = "0.6"
 lzma-rust2 = { version = "0.21", default-features = false, features = ["std", "xz", "encoder", "optimization"] }
 rsa = "0.9"

@@ -234,6 +234,7 @@ version = "3.0.0"
 dependencies = [
  "brotli",
  "bzip2",
+ "flate2",
  "img2sdat",
  "lzma-rust2",
  "rsa",

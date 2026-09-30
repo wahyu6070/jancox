@@ -1,11 +1,12 @@
 //! Read-only EROFS reader for Android images: compact and extended inodes,
-//! flat (plain and inline tail) and chunk-based files, directories, and
-//! xattrs (inline, shared, long name prefixes).
-//!
-//! Compressed files (lz4, lzma, ...) are not supported yet: reading one
-//! fails with an error naming the file layout.
+//! flat (plain and inline tail) and chunk-based files, compressed files
+//! (lz4, lzma, deflate, zstd; see `z.rs`), directories, and xattrs
+//! (inline, shared, long name prefixes).
 
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::sync::Arc;
+
+mod z;
 
 use super::ext4::uuid;
 use super::{invalid, parse_capability, Filesystem, Kind, Meta};
@@ -29,9 +30,7 @@ const INCOMPAT_FRAGMENTS: u32 = 0x20;
 const INCOMPAT_XATTR_PREFIXES: u32 = 0x40;
 const INCOMPAT_48BIT: u32 = 0x80;
 const INCOMPAT_METABOX: u32 = 0x100;
-/// Features that change how the metadata we read is laid out. The
-/// compression ones only matter for compressed files, which are refused
-/// one by one.
+/// Features that change how the metadata we read is laid out.
 const INCOMPAT_SUPPORTED: u32 = INCOMPAT_ZERO_PADDING
     | INCOMPAT_COMPR_CFGS
     | INCOMPAT_CHUNKED_FILE
@@ -163,6 +162,9 @@ pub struct Erofs<R> {
     sb: Superblock,
     /// Long xattr name prefixes: (base index, infix).
     long_prefixes: Vec<(u8, Vec<u8>)>,
+    zcfg: z::Config,
+    /// Recently decoded extents: (nid, logical start, bytes).
+    zcache: Vec<(u64, u64, Arc<Vec<u8>>)>,
 }
 
 impl<R: Read + Seek> Erofs<R> {
@@ -201,9 +203,92 @@ impl<R: Read + Seek> Erofs<R> {
             r,
             sb,
             long_prefixes: Vec::new(),
+            zcfg: z::Config::default(),
+            zcache: Vec::new(),
         };
+        fs.read_compr_cfgs()?;
         fs.read_long_prefixes()?;
         Ok(fs)
+    }
+
+    /// Compression settings: after the superblock, one (u16 length, data)
+    /// record per algorithm in `available_compr_algs`, 4-byte aligned.
+    fn read_compr_cfgs(&mut self) -> io::Result<()> {
+        if self.sb.incompat & INCOMPAT_COMPR_CFGS == 0 {
+            // old images: lz4 only
+            self.zcfg.algs = 1 << z::LZ4;
+            self.zcfg.max_pclusterblks = 1;
+            return Ok(());
+        }
+        let algs = le16(&self.sb.raw, 84);
+        if algs & !0xF != 0 {
+            return Err(invalid(format!(
+                "unknown EROFS compression algorithms 0x{:x}",
+                algs
+            )));
+        }
+        self.zcfg.algs = algs;
+        let mut pos = SUPERBLOCK_OFFSET + 128 + self.sb.raw[13] as u64 * 16;
+        for alg in 0..4u8 {
+            if algs & (1 << alg) == 0 {
+                continue;
+            }
+            pos = pos.next_multiple_of(4);
+            let len = le16(&self.read_vec(pos, 2)?, 0) as u64;
+            if len == 0 {
+                return Err(invalid("bad EROFS compression config"));
+            }
+            let data = self.read_vec(pos + 2, len)?;
+            pos += 2 + len;
+            match alg {
+                z::LZ4 if data.len() >= 4 => {
+                    self.zcfg.max_pclusterblks = le16(&data, 2).max(1);
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn packed_nid(&self) -> Option<u64> {
+        Some(le64(&self.sb.raw, 96)).filter(|&n| n != 0)
+    }
+
+    /// `len` bytes at `off` of the packed inode (fragments, and long xattr
+    /// prefixes in newer images).
+    fn packed_read(&mut self, off: u64, len: u64) -> io::Result<Vec<u8>> {
+        let nid = self
+            .packed_nid()
+            .ok_or_else(|| invalid("EROFS fragment without a packed inode"))?;
+        let inode = self.inode(nid)?;
+        self.read_range(&inode, off, len)
+    }
+
+    /// `len` bytes at `off` of any file.
+    fn read_range(&mut self, inode: &Inode, off: u64, len: u64) -> io::Result<Vec<u8>> {
+        if matches!(
+            inode.layout,
+            LAYOUT_COMPRESSED_FULL | LAYOUT_COMPRESSED_COMPACT
+        ) {
+            return self.zread(inode, off, len);
+        }
+        let end = off
+            .checked_add(len)
+            .filter(|&e| e <= inode.size)
+            .ok_or_else(|| invalid(format!("inode {}: read past the end", inode.nid)))?;
+        let mut out = Vec::with_capacity(len.min(1 << 20) as usize);
+        let mut at = 0u64;
+        for p in self.pieces(inode)? {
+            let (from, to) = (off.max(at), end.min(at + p.len));
+            if from < to {
+                match p.physical {
+                    Some(phys) => out.extend(self.read_vec(phys + from - at, to - from)?),
+                    None => out.resize(out.len() + (to - from) as usize, 0),
+                }
+            }
+            at += p.len;
+        }
+        Ok(out)
     }
 
     fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
@@ -212,6 +297,11 @@ impl<R: Read + Seek> Erofs<R> {
     }
 
     fn read_vec(&mut self, offset: u64, len: u64) -> io::Result<Vec<u8>> {
+        // a damaged length must not become a huge allocation
+        let end = offset.checked_add(len);
+        if end.is_none_or(|e| e > self.sb.blocks.saturating_mul(self.sb.block_size)) {
+            return Err(invalid("EROFS read past the end of the image"));
+        }
         let mut buf = vec![0u8; len as usize];
         self.read_at(offset, &mut buf)?;
         Ok(buf)
@@ -224,20 +314,22 @@ impl<R: Read + Seek> Erofs<R> {
         if self.sb.incompat & INCOMPAT_XATTR_PREFIXES == 0 || count == 0 {
             return Ok(());
         }
-        if le64(&self.sb.raw, 96) != 0 {
-            return Err(invalid(
-                "EROFS long xattr prefixes in a packed inode are not supported yet",
-            ));
-        }
+        // in the packed inode when there is one, else in the image
+        let packed = self.packed_nid().is_some();
         let mut pos = (le32(&self.sb.raw, 92) as u64) << 2;
         for _ in 0..count {
-            let mut len = [0u8; 2];
-            self.read_at(pos, &mut len)?;
-            let len = u16::from_le_bytes(len) as u64;
+            let len = match packed {
+                true => self.packed_read(pos, 2)?,
+                false => self.read_vec(pos, 2)?,
+            };
+            let len = le16(&len, 0) as u64;
             if len == 0 {
                 return Err(invalid("bad EROFS long xattr prefix"));
             }
-            let p = self.read_vec(pos + 2, len)?;
+            let p = match packed {
+                true => self.packed_read(pos + 2, len)?,
+                false => self.read_vec(pos + 2, len)?,
+            };
             self.long_prefixes.push((p[0], p[1..].to_vec()));
             pos += (2 + len).next_multiple_of(4);
         }
@@ -249,7 +341,7 @@ impl<R: Read + Seek> Erofs<R> {
     }
 
     fn inode(&mut self, nid: u64) -> io::Result<Inode> {
-        if nid * 32 >= self.sb.blocks * self.sb.block_size {
+        if nid >= self.sb.blocks.saturating_mul(self.sb.block_size) / 32 {
             return Err(invalid(format!("inode {} is outside the filesystem", nid)));
         }
         let mut b = [0u8; 64];
@@ -376,7 +468,7 @@ impl<R: Read + Seek> Erofs<R> {
                 Ok(out)
             }
             LAYOUT_COMPRESSED_FULL | LAYOUT_COMPRESSED_COMPACT => Err(invalid(format!(
-                "inode {}: compressed EROFS files are not supported yet",
+                "inode {}: compressed file read as a flat one",
                 inode.nid
             ))),
             l => Err(invalid(format!(
@@ -387,6 +479,12 @@ impl<R: Read + Seek> Erofs<R> {
     }
 
     fn copy_data(&mut self, inode: &Inode, out: &mut dyn Write) -> io::Result<u64> {
+        if matches!(
+            inode.layout,
+            LAYOUT_COMPRESSED_FULL | LAYOUT_COMPRESSED_COMPACT
+        ) {
+            return self.zcopy(inode, out);
+        }
         let pieces = self.pieces(inode)?;
         let mut buf = vec![0u8; 1 << 20];
         let mut total = 0;
@@ -409,8 +507,15 @@ impl<R: Read + Seek> Erofs<R> {
         Ok(total)
     }
 
+    /// Contents of a directory or symlink (never bigger than the image).
     fn data(&mut self, inode: &Inode) -> io::Result<Vec<u8>> {
-        let mut v = Vec::with_capacity(inode.size as usize);
+        if inode.size > self.sb.blocks.saturating_mul(self.sb.block_size) {
+            return Err(invalid(format!(
+                "inode {}: bad size {}",
+                inode.nid, inode.size
+            )));
+        }
+        let mut v = Vec::with_capacity(inode.size.min(1 << 20) as usize);
         self.copy_data(inode, &mut v)?;
         Ok(v)
     }
@@ -476,6 +581,28 @@ impl<R: Read + Seek> Erofs<R> {
             pos += len;
         }
         Ok(out)
+    }
+}
+
+impl<R> Erofs<R> {
+    /// Algorithms (and lz4 pcluster size) of a compressed image, for
+    /// `<part>_info`.
+    fn compression_info(&self) -> Vec<(String, String)> {
+        if self.sb.incompat & (INCOMPAT_COMPR_CFGS | INCOMPAT_ZERO_PADDING) == 0 {
+            return Vec::new();
+        }
+        let algs: Vec<&str> = (0..4)
+            .filter(|a| self.zcfg.algs & (1 << a) != 0)
+            .map(|a| z::ALG_NAMES[a])
+            .collect();
+        let mut out = vec![("compression".to_string(), algs.join(","))];
+        if self.zcfg.algs & 1 != 0 {
+            out.push((
+                "pcluster_blocks".to_string(),
+                self.zcfg.max_pclusterblks.to_string(),
+            ));
+        }
+        out
     }
 }
 
@@ -613,6 +740,131 @@ impl<R: Read + Seek> Filesystem for Erofs<R> {
         ]
         .into_iter()
         .map(|(k, v)| (k.to_string(), v))
+        .chain(self.compression_info())
         .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    fn rand(n: usize, seed: u64) -> Vec<u8> {
+        let mut x = seed;
+        let mut out = Vec::with_capacity(n + 8);
+        while out.len() < n {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+        out.truncate(n);
+        out
+    }
+
+    fn text(n: usize) -> Vec<u8> {
+        b"jancox erofs lz4 android\n"
+            .iter()
+            .copied()
+            .cycle()
+            .take(n)
+            .collect()
+    }
+
+    /// The files mkfs.erofs 1.9.4 (1.7.1 for deflate) packed into the test
+    /// images, with lz4hc + big pclusters + ztailpacking + fragments +
+    /// dedupe, lzma with full indexes, zstd, and lz4 with deflate for `mix`.
+    fn expected() -> Vec<(&'static str, Vec<u8>)> {
+        let mut mix = text(9000);
+        mix.extend(rand(5000, 2));
+        mix.extend(text(7777));
+        vec![
+            ("text", text(300_001)),
+            ("rand", rand(20000, 1)),
+            ("zero", vec![0; 70000]),
+            ("tiny", b"hi\n".to_vec()),
+            ("sub/dup1", text(50000)),
+            ("sub/dup2", text(50000)),
+            ("mix", mix),
+        ]
+    }
+
+    fn lookup<R: Read + Seek>(fs: &mut Erofs<R>, path: &str) -> io::Result<u64> {
+        let mut node = fs.root();
+        for part in path.split('/') {
+            node = fs
+                .read_dir(node)?
+                .into_iter()
+                .find(|(n, _)| n == part.as_bytes())
+                .map(|(_, c)| c)
+                .ok_or_else(|| invalid(format!("{} not found", path)))?;
+        }
+        Ok(node)
+    }
+
+    const IMAGES: [(&str, &[u8]); 4] = [
+        ("lz4", include_bytes!("../../testdata/erofs_lz4.img")),
+        ("lzma", include_bytes!("../../testdata/erofs_lzma.img")),
+        ("zstd", include_bytes!("../../testdata/erofs_zstd.img")),
+        (
+            "deflate",
+            include_bytes!("../../testdata/erofs_deflate.img"),
+        ),
+    ];
+
+    #[test]
+    fn compressed_images() {
+        for (alg, img) in IMAGES {
+            let mut fs = Erofs::open(Cursor::new(img.to_vec())).unwrap();
+            let info = fs.info();
+            let comp = info.iter().find(|(k, _)| k == "compression").unwrap();
+            assert!(
+                comp.1.contains(alg.trim_end_matches("hc")),
+                "{}: {:?}",
+                alg,
+                comp
+            );
+            for (path, want) in expected() {
+                let node = lookup(&mut fs, path).unwrap();
+                let mut got = Vec::new();
+                fs.read_file(node, &mut got).unwrap();
+                assert!(got == want, "{}: {} differs", alg, path);
+            }
+        }
+    }
+
+    #[test]
+    fn damaged_images_fail_cleanly() {
+        for (_, img) in IMAGES {
+            // cut short, and garbage over the data blocks
+            let short = img[..img.len() / 2].to_vec();
+            let mut garbage = img.to_vec();
+            for (i, b) in garbage.iter_mut().enumerate().skip(8192) {
+                *b = (i as u8).wrapping_mul(151) ^ 0x5a;
+            }
+            let mut metadata = Vec::new();
+            for seed in 0..40u64 {
+                let mut m = img.to_vec();
+                let noise = rand(8192, seed + 11);
+                // flip bits after the superblock: inodes, indexes, dirs
+                for (i, b) in m.iter_mut().enumerate().take(8192).skip(1152) {
+                    if noise[i].is_multiple_of(23) {
+                        *b ^= noise[i.wrapping_mul(7) % 8192] | 1;
+                    }
+                }
+                metadata.push(m);
+            }
+            for bad in [short, garbage].into_iter().chain(metadata) {
+                let Ok(mut fs) = Erofs::open(Cursor::new(bad)) else {
+                    continue;
+                };
+                for (path, _) in expected() {
+                    if let Ok(node) = lookup(&mut fs, path) {
+                        let _ = fs.read_file(node, &mut Vec::new());
+                    }
+                }
+            }
+        }
     }
 }

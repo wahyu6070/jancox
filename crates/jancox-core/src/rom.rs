@@ -1191,7 +1191,8 @@ fn repack_fastboot(
                 }
             }
         }
-        factory::check_groups(groups, &sizes)?;
+        factory::check_groups(groups, &sizes)
+            .map_err(|e| compressed_hint(e, work, &state.partitions))?;
     }
 
     // the image zip: entries in their original order, then new files
@@ -1271,6 +1272,35 @@ fn repack_fastboot(
     fs::remove_file(&inner_path)?;
     zip.finish().map_err(zip_err)?.flush()?;
     Ok(())
+}
+
+/// A "doesn't fit" error with the likely reason when the original images
+/// were compressed EROFS: jancox rebuilds them uncompressed for now.
+fn compressed_hint(e: io::Error, work: &Path, parts: &[Partition]) -> io::Error {
+    if e.kind() != io::ErrorKind::StorageFull {
+        return e;
+    }
+    let compressed: Vec<&str> = parts
+        .iter()
+        .filter(|p| {
+            let info = partition_dir(work)
+                .join("config")
+                .join(format!("{}_info", p.name));
+            prop(&info, "compression").is_some()
+        })
+        .map(|p| p.name.as_str())
+        .collect();
+    if compressed.is_empty() {
+        return e;
+    }
+    io::Error::new(
+        e.kind(),
+        format!(
+            "{}. The original {} were compressed EROFS images; jancox rebuilds EROFS without compression for now, which takes more space",
+            e,
+            compressed.join(", ")
+        ),
+    )
 }
 
 /// The ROM zip that was unpacked: the recorded path, else the zip in
@@ -1417,7 +1447,8 @@ fn repack_payload(
         sizes.insert(p.name.clone(), size);
         sources.push(source);
     }
-    factory::check_groups(&m.groups, &sizes)?;
+    factory::check_groups(&m.groups, &sizes)
+        .map_err(|e| compressed_hint(e, work, &state.partitions))?;
 
     let fastboot_path = match opts.payload_output {
         PayloadOutput::Both => {

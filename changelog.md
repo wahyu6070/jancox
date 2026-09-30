@@ -7,7 +7,8 @@
 - payload.bin ROMs repack: a new OTA zip (signed payload.bin with the AOSP test key or your own, payload_properties.txt, metadata with new property files, whole-zip signature) and/or a fastboot ROM with flash-all.sh/.bat. Pick with `payload.output=payload|fastboot|both` in `jancox.prop` (default payload) or `repack -t`. Unchanged images are copied from the old payload; vbmeta gets the disable-verity flags
 - ext4: images with `shared_blocks` (Android 10+ block sharing) are rebuilt with it, so an unchanged partition keeps its size
 - ext4: a rebuild at the original size keeps the original inode count
-- Recovery ROMs with uncompressed EROFS inside `*.new.dat.br` work too. Compressed EROFS (lz4/lzma, used by most non-Pixel ROMs) is not supported yet
+- EROFS: compressed images are read: lz4/lz4hc, lzma, deflate, zstd, with big pclusters, ztailpacking, fragments, dedupe and both index formats (checked against fsck.erofs and a kernel mount on a Xiaomi HyperOS ROM). They are still rebuilt uncompressed
+- Recovery ROMs with uncompressed EROFS inside `*.new.dat.br` work too
 
 ## 3.0.0 25-09-2026
 - Rewritten in Rust: one `jancox` binary for Android, Linux and Windows; no Python, busybox or Termux packages, no root needed

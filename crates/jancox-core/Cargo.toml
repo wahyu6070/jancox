@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 brotli.workspace = true
 bzip2.workspace = true
+flate2.workspace = true
 img2sdat.workspace = true
 lzma-rust2.workspace = true
 rsa.workspace = true

@@ -6,21 +6,18 @@
 
 ## EROFS
 
-Uncompressed EROFS is read (`fs/erofs.rs`) and written (`fs/mkerofs.rs`), and was checked against a Pixel factory image (cubs, CD1A.260905.001.B1). The images were compared with `fsck.erofs --extract` 1.9.4 and loop-mounted. erofs-utils 1.7.1 (Ubuntu 24.04) truncates chunk-based files, so don't use it as a reference. 1.9.4 builds without autotools: compile `lib/*.c` + `{fsck,mkfs,dump}/main.c` with a hand-written `config.h`.
+EROFS is read (`fs/erofs.rs`, compressed files in `fs/erofs/z.rs`) and written uncompressed (`fs/mkerofs.rs`). Checked against a Pixel factory image (cubs, CD1A.260905.001.B1, uncompressed) and a Xiaomi Redmi Note 13 4G OTA (sapphire, OS2.0.205.0.VNGMIXM, lz4 + 0padding): all 8 partitions extract identical to `fsck.erofs --extract` 1.9.4, and vendor matches a kernel loop mount (contents, owners, modes, labels). A test matrix of mkfs.erofs 1.9.4 images (lz4, lz4hc, lzma, deflate, zstd x big pclusters, ztailpacking, fragments, all-fragments, dedupe, legacy full indexes, small extents, long xattr prefixes in the packed inode) extracts identical to the source tree; mixed algorithms (HEAD2 via `--compress-hints`) were checked with mkfs 1.7.1 because 1.9.4 segfaults on compress hints. erofs-utils 1.7.1 (Ubuntu 24.04) truncates chunk-based files, so don't use it as a reference. 1.9.4 builds with `./autogen.sh && ./configure --enable-lzma --with-libzstd --disable-fuse` (packages: autoconf automake libtool liblz4-dev liblzma-dev libzstd-dev uuid-dev zlib1g-dev).
 
-- Compressed files (datalayout 1 and 3) are refused. Most non-Pixel EROFS ROMs (Xiaomi, OnePlus, ...) are lz4/lz4hc compressed. To add:
-  - lz4 / lz4hc first (the Android default), then lzma (MicroLZMA), deflate and zstd
-  - full and compact indexes, big pclusters, ztailpacking, fragments (packed inode), dedupe
-  - long xattr prefixes stored in the packed inode
+- Reader: the new extent-record format (`Z_EROFS_ADVISE_EXTENTS`) and `48bit` / `metabox` images are untested (no mkfs here makes the first by default; the others are refused).
 - Writer: no chunk-based dedupe or holes. Pixel images share identical blocks and leave zero blocks as holes; ours are up to about 6% bigger (vendor 1.21 GB vs 1.14 GB). Pixel partitions fit the super group easily, but on a recovery ROM with EROFS and fixed-size partitions (no `dynamic_partitions_op_list`), even an unchanged rebuild can exceed the partition and fail with "remove some files". Holes and chunk dedupe fix that.
-- Writer: no compression (option `erofs.compress=lz4hc` in `jancox.prop`?).
+- Writer: no compression. A compressed EROFS ROM rebuilt uncompressed doesn't fit: the Redmi Note 13 4G partitions need 8.99 GB uncompressed against a 7.16 GiB super group, and repack stops with a message saying so. An lz4 writer (fixed-input big pclusters) is next.
 - Writer: no xattr bloom filter (`xattr_filter`) and no `mtime` feature bit. Every inode gets the build time.
 
 ## payload.bin ROMs
 
 A/B OTA zips (`payload.bin` + `payload_properties.txt`). Unpack and repack work (`payload.rs`, `sign.rs`, `ota.rs`, `rom.rs`), checked with the ASUS ROG Phone 5 full OTA: all 29 SHA-256 match on unpack; the repacked payload passes AOSP `paycheck.py --check` with the test key, the zip signature verifies (`openssl cms`), and unpacking it again gives the same trees and images. The re-encoded xz blobs also decode with liblzma (Python `lzma`) to the right SHA-256, so they don't only work with lzma-rust2. Not flashed on a device yet.
 
-Most payload ROMs from Xiaomi, OnePlus and others ship lz4 EROFS. Until compressed EROFS works, those unpack only as far as the images: extraction fails.
+Most payload ROMs from Xiaomi, OnePlus and others ship lz4 EROFS: they unpack (Redmi Note 13 4G checked), but don't repack until the EROFS writer compresses.
 
 ### Open points
 
