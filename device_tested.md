@@ -8,7 +8,7 @@ ROMs that Jancox 3.x has been tested with. Add a row when you test another ROM: 
 |--------|----------|-----|---------|----------|------------|--------|--------|------|--------|
 | Xiaomi POCO X3 NFC | surya | crDroid | 15 | Recovery (`*.new.dat.br`, dynamic partitions) | ext4 | ✅ | ✅ | not tested | 3.0.0 |
 | Google Pixel | cubs | Factory image `cubs-cd1a.260905.001.b1` | 17 | Fastboot (`image-*.zip`, `super_empty.img`) | EROFS (uncompressed) | ✅ | ✅ | not tested | unreleased (after 3.0.0) |
-| ASUS ROG Phone 5 (ZS673KS) | ASUS_I005_1 (I005D) | Stock WW `33.0210.0210.200` (`UL-ASUS_I005_1-ASUS-33.0210.0210.200-1.1.300-2304-user.zip`) | 13 | A/B OTA (`payload.bin`, full OTA, dynamic partitions) | ext4 | ✅ | ❌ not supported yet | not tested | unreleased (after 3.0.0) |
+| ASUS ROG Phone 5 (ZS673KS) | ASUS_I005_1 (I005D) | Stock WW `33.0210.0210.200` (`UL-ASUS_I005_1-ASUS-33.0210.0210.200-1.1.300-2304-user.zip`) | 13 | A/B OTA (`payload.bin`, full OTA, dynamic partitions) | ext4 (`shared_blocks`) | ✅ | ✅ (OTA zip + fastboot) | not tested | unreleased (after 3.0.0) |
 
 ## Notes
 
@@ -28,4 +28,5 @@ ROMs that Jancox 3.x has been tested with. Add a row when you test another ROM: 
 - A/B full OTA: `payload.bin` (3.6 GB) with 29 partitions, using REPLACE, REPLACE_XZ and REPLACE_BZ operations. Dynamic group `qti_dynamic_partitions` holds odm, product, system, system_ext and vendor, all ext4.
 - The manifest is ASUS-modified: fields 16 and up hold ASUS strings.
 - Unpack: all 29 images match the SHA-256 in the payload. The 5 logical partitions pass `e2fsck -fn` and are extracted to `partition/`. The other 24 images (boot, vendor_boot, vbmeta, modem, xrom, ...) are in `rom/payload/`. It takes about 1 minute; `jancox payload` alone dumps all images in about 40 s.
-- Repack of payload.bin ROMs is not supported yet (see `TODO.md`).
+- The images use `shared_blocks` (block sharing). Jancox rebuilds them with it: an unchanged product image comes out with exactly the same number of used blocks (481884) as ASUS's.
+- Repack (`-t both`, about 3 minutes): a signed OTA zip (3.9 GB) and a fastboot zip. The new payload passes AOSP `paycheck.py --check` with the test key. The payload/metadata signatures, `payload_properties.txt`, the `ota-property-files` offsets and the whole-zip signature (`openssl cms -verify`) all check out. The rebuilt partitions pass `e2fsck -fn`. Unpacking the new zip gives the same folders, metadata and images (vbmeta differs only in the disable-verity flags).

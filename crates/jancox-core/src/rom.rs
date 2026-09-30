@@ -32,17 +32,26 @@ use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 use crate::build::{self, Size};
 use crate::fs::invalid;
-use crate::{br, extract, factory, payload, sdat};
+use crate::sign::{self, Key};
+use crate::{br, extract, factory, ota, payload, sdat};
 
 const STATE: &str = "jancox_rom";
 const OP_LIST: &str = "dynamic_partitions_op_list";
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct RepackOptions {
     /// Brotli quality (0-11) for `.new.dat.br`.
     pub brotli_quality: u32,
     /// Deflate level (0-9) for the other files in the zip.
     pub zip_level: i64,
+    /// payload.bin ROMs: which zips repack makes.
+    pub payload_output: PayloadOutput,
+    /// xz preset (0-9) for rebuilt images in a new payload.bin.
+    pub xz_level: u32,
+    /// Private key (`.pk8`) and certificate for a new payload.bin; the AOSP
+    /// test key when both are `None`.
+    pub sign_key: Option<PathBuf>,
+    pub sign_cert: Option<PathBuf>,
 }
 
 impl Default for RepackOptions {
@@ -50,7 +59,40 @@ impl Default for RepackOptions {
         RepackOptions {
             brotli_quality: br::DEFAULT_QUALITY,
             zip_level: 1,
+            payload_output: PayloadOutput::Payload,
+            xz_level: 1,
+            sign_key: None,
+            sign_cert: None,
         }
+    }
+}
+
+/// What `repack` makes from a payload.bin ROM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PayloadOutput {
+    /// A new OTA zip with payload.bin, for recovery / adb sideload.
+    Payload,
+    /// The images with flash-all.sh / flash-all.bat.
+    Fastboot,
+    Both,
+}
+
+impl PayloadOutput {
+    pub fn parse(s: &str) -> Option<PayloadOutput> {
+        match s {
+            "payload" => Some(PayloadOutput::Payload),
+            "fastboot" => Some(PayloadOutput::Fastboot),
+            "both" => Some(PayloadOutput::Both),
+            _ => None,
+        }
+    }
+
+    fn payload(self) -> bool {
+        self != PayloadOutput::Fastboot
+    }
+
+    fn fastboot(self) -> bool {
+        self != PayloadOutput::Payload
     }
 }
 
@@ -197,6 +239,21 @@ brotli.level=1
 
 # deflate level for the other files in the ROM zip: 0 (store) - 9 (smallest)
 zip.level=1
+
+# payload.bin (A/B OTA) ROMs: what repack makes
+#   payload  = a new OTA zip with payload.bin (custom recovery or adb sideload)
+#   fastboot = the images with flash-all.sh / flash-all.bat (fastboot)
+#   both     = both zips
+payload.output=payload
+
+# xz level for rebuilt partitions in payload.bin: 0 (fastest) - 9 (smallest)
+payload.xz_level=1
+
+# key for the new payload.bin and the zip signature (paths from this folder).
+# Unset = AOSP test key, trusted by TWRP, OrangeFox and other test-keys
+# recoveries. Stock recoveries only take the vendor's own key.
+#sign.key=keys/releasekey.pk8
+#sign.cert=keys/releasekey.x509.pem
 ";
 
 /// Creates `input/`, `output/` and a default `jancox.prop` in `work`, each
@@ -246,6 +303,14 @@ pub fn load_config(work: &Path) -> io::Result<RepackOptions> {
                     .filter(|z| (0..=9).contains(z))
                     .ok_or_else(bad)?
             }
+            "payload.output" => {
+                opts.payload_output = PayloadOutput::parse(value).ok_or_else(bad)?
+            }
+            "payload.xz_level" => {
+                opts.xz_level = value.parse().ok().filter(|l| *l <= 9).ok_or_else(bad)?
+            }
+            "sign.key" if !value.is_empty() => opts.sign_key = Some(work.join(value)),
+            "sign.cert" if !value.is_empty() => opts.sign_cert = Some(work.join(value)),
             // unknown keys are ignored, so newer settings don't break older builds
             _ => {}
         }
@@ -878,17 +943,20 @@ fn update_op_list(text: &str, sizes: &BTreeMap<String, u64>) -> io::Result<Strin
     Ok(out)
 }
 
-/// Repacks `work` into a new ROM zip. Returns its path.
+/// Repacks `work` into a new ROM zip. Returns the zips it wrote (two for
+/// a payload.bin ROM with `payload.output=both`).
 pub fn repack(
     work: &Path,
     output: Option<&Path>,
     opts: RepackOptions,
     mut log: impl FnMut(&str),
-) -> io::Result<PathBuf> {
+) -> io::Result<Vec<PathBuf>> {
     let state = read_full_state(work)?
         .ok_or_else(|| invalid(format!("{} is not unpacked (no {})", work.display(), STATE)))?;
-    if opts.brotli_quality > 11 || !(0..=9).contains(&opts.zip_level) {
-        return Err(invalid("brotli quality must be 0-11 and zip level 0-9"));
+    if opts.brotli_quality > 11 || !(0..=9).contains(&opts.zip_level) || opts.xz_level > 9 {
+        return Err(invalid(
+            "brotli quality must be 0-11, zip level 0-9 and xz level 0-9",
+        ));
     }
     let out_path = match output {
         Some(p) => p.to_path_buf(),
@@ -901,16 +969,21 @@ pub fn repack(
     let tmp = work.join("tmp");
     fs::create_dir_all(&tmp)?;
 
+    if state.format == Format::Payload {
+        let result = repack_payload(work, &state, &out_path, &tmp, &opts, &mut log);
+        let _ = fs::remove_dir_all(&tmp);
+        return result;
+    }
     let result = match state.format {
-        Format::Sdat => repack_sdat(work, &state.partitions, &partial, &tmp, opts, &mut log),
-        Format::Fastboot => repack_fastboot(work, &state, &partial, &tmp, opts, &mut log),
-        Format::Payload => Err(invalid("repacking payload.bin ROMs is not supported yet")),
+        Format::Sdat => repack_sdat(work, &state.partitions, &partial, &tmp, &opts, &mut log),
+        Format::Fastboot => repack_fastboot(work, &state, &partial, &tmp, &opts, &mut log),
+        Format::Payload => unreachable!(),
     };
     let _ = fs::remove_dir_all(&tmp);
     match result {
         Ok(()) => {
             fs::rename(&partial, &out_path)?;
-            Ok(out_path)
+            Ok(vec![out_path])
         }
         Err(e) => {
             let _ = fs::remove_file(&partial);
@@ -919,7 +992,7 @@ pub fn repack(
     }
 }
 
-fn zip_options(opts: RepackOptions) -> (SimpleFileOptions, SimpleFileOptions) {
+fn zip_options(opts: &RepackOptions) -> (SimpleFileOptions, SimpleFileOptions) {
     let deflate = SimpleFileOptions::default()
         .compression_method(CompressionMethod::Deflated)
         .compression_level(Some(opts.zip_level))
@@ -952,7 +1025,7 @@ fn repack_sdat(
     parts: &[Partition],
     partial: &Path,
     tmp: &Path,
-    opts: RepackOptions,
+    opts: &RepackOptions,
     log: &mut impl FnMut(&str),
 ) -> io::Result<()> {
     let rom_dir = work.join("rom");
@@ -1066,7 +1139,7 @@ fn repack_fastboot(
     state: &State,
     partial: &Path,
     tmp: &Path,
-    opts: RepackOptions,
+    opts: &RepackOptions,
     log: &mut impl FnMut(&str),
 ) -> io::Result<()> {
     let rom_dir = work.join("rom");
@@ -1196,6 +1269,452 @@ fn repack_fastboot(
     log(&format!("- Adding {}", state.image_zip));
     add_file(&mut zip, &state.image_zip, &inner_path, stored)?;
     fs::remove_file(&inner_path)?;
+    zip.finish().map_err(zip_err)?.flush()?;
+    Ok(())
+}
+
+/// The ROM zip that was unpacked: the recorded path, else the zip in
+/// `input/`. Repack of a payload.bin ROM copies unchanged partitions from it.
+fn recorded_input(work: &Path) -> io::Result<PathBuf> {
+    let text = fs::read_to_string(state_path(work))?;
+    if let Some(p) = text.lines().find_map(|l| l.strip_prefix("input=")) {
+        let p = PathBuf::from(p);
+        if p.is_file() {
+            return Ok(p);
+        }
+    }
+    find_input(work).ok_or_else(|| {
+        invalid(format!(
+            "the unpacked ROM zip is gone; put it back in {} (repack copies the unchanged partitions from it)",
+            work.join("input").display()
+        ))
+    })
+}
+
+fn load_key(opts: &RepackOptions) -> io::Result<Key> {
+    match (&opts.sign_key, &opts.sign_cert) {
+        (None, None) => Key::test_key(),
+        (Some(k), Some(c)) => Key::load(k, c),
+        _ => Err(invalid(format!(
+            "set both sign.key and sign.cert in {}",
+            CONFIG
+        ))),
+    }
+}
+
+/// How a partition of a payload is repacked.
+enum Source {
+    /// Unchanged: its operations and blobs are copied from the old payload.
+    Keep(PathBuf),
+    /// A new or changed image.
+    Image(PathBuf),
+}
+
+impl Source {
+    fn path(&self) -> &Path {
+        match self {
+            Source::Keep(p) | Source::Image(p) => p,
+        }
+    }
+}
+
+fn repack_payload(
+    work: &Path,
+    state: &State,
+    out_path: &Path,
+    tmp: &Path,
+    opts: &RepackOptions,
+    log: &mut impl FnMut(&str),
+) -> io::Result<Vec<PathBuf>> {
+    let input = recorded_input(work)?;
+    let (mut reader, info) = payload::open(&input)?;
+    let m = &info.manifest;
+    m.check_full()?;
+    for p in &state.partitions {
+        if m.partition(&p.name).is_none() {
+            return Err(invalid(format!(
+                "{} has no partition {}; was {} unpacked from another ROM?",
+                input.display(),
+                p.name,
+                work.display()
+            )));
+        }
+    }
+    // fail before the slow part when the key is wrong
+    let key = match opts.payload_output.payload() {
+        true => Some(load_key(opts)?),
+        false => None,
+    };
+    let bs = m.block_size as u64;
+    let logical: std::collections::HashSet<&str> = m
+        .groups
+        .iter()
+        .flat_map(|g| &g.partitions)
+        .map(|p| factory::strip_slot(p))
+        .collect();
+    let images = work.join("rom").join(PAYLOAD_IMAGES);
+    let parts_dir = partition_dir(work);
+
+    // the images: rebuilt partitions, changed images, unchanged images
+    let mut sources = Vec::new();
+    let mut sizes = BTreeMap::new();
+    for p in &m.partitions {
+        let is_logical = logical.contains(p.name.as_str());
+        let source = if state.partitions.iter().any(|x| x.name == p.name) {
+            let img = tmp.join(format!("{}.img", p.name));
+            match build::build(&parts_dir, &p.name, &img, Size::Original, &mut *log) {
+                // logical partitions take the size of their image
+                Err(e) if e.kind() == io::ErrorKind::StorageFull && is_logical => {
+                    log(&format!(
+                        "- {} is full, growing it (dynamic partition)",
+                        p.name
+                    ));
+                    build::build(&parts_dir, &p.name, &img, Size::Auto, &mut *log)?;
+                }
+                other => {
+                    other?;
+                }
+            }
+            Source::Image(img)
+        } else {
+            let path = images.join(format!("{}.img", p.name));
+            if !path.is_file() {
+                return Err(invalid(format!(
+                    "{} is missing; the new ROM needs every partition of the payload",
+                    path.display()
+                )));
+            }
+            if p.name == "vbmeta" {
+                let mut data = fs::read(&path)?;
+                if factory::disable_verification(&mut data)? {
+                    log("- vbmeta: dm-verity and AVB verification disabled");
+                    log("  (the rebuilt partitions have no hashtree; the device must be unlocked)");
+                    let patched = tmp.join("vbmeta.img");
+                    fs::write(&patched, &data)?;
+                    sources.push(Source::Image(patched));
+                    sizes.insert(p.name.clone(), data.len() as u64);
+                    continue;
+                }
+            }
+            let len = fs::metadata(&path)?.len();
+            if len == p.size && sign::sha256_file(&path)?[..] == p.hash[..] {
+                Source::Keep(path)
+            } else {
+                log(&format!("- {}: changed, it will be re-encoded", p.name));
+                Source::Image(path)
+            }
+        };
+        let size = fs::metadata(source.path())?.len().div_ceil(bs) * bs;
+        if !is_logical && size > p.size {
+            return Err(io::Error::new(
+                io::ErrorKind::StorageFull,
+                format!(
+                    "{} is {} bytes, more than its {} byte partition",
+                    p.name, size, p.size
+                ),
+            ));
+        }
+        sizes.insert(p.name.clone(), size);
+        sources.push(source);
+    }
+    factory::check_groups(&m.groups, &sizes)?;
+
+    let fastboot_path = match opts.payload_output {
+        PayloadOutput::Both => {
+            let stem = out_path
+                .file_stem()
+                .map_or("NewROM".into(), |s| s.to_string_lossy().into_owned());
+            out_path.with_file_name(format!("{}-fastboot.zip", stem))
+        }
+        _ => out_path.to_path_buf(),
+    };
+    let mut written = Vec::new();
+    if let Some(key) = &key {
+        let partial = out_path.with_extension("zip.part");
+        let result = write_ota(
+            work,
+            state,
+            &info,
+            &mut reader,
+            &sources,
+            &partial,
+            tmp,
+            opts,
+            key,
+            log,
+        );
+        match result {
+            Ok(()) => fs::rename(&partial, out_path)?,
+            Err(e) => {
+                let _ = fs::remove_file(&partial);
+                return Err(e);
+            }
+        }
+        written.push(out_path.to_path_buf());
+    }
+    if opts.payload_output.fastboot() {
+        let partial = fastboot_path.with_extension("zip.part");
+        match write_payload_fastboot(m, &sources, &partial, log) {
+            Ok(()) => fs::rename(&partial, &fastboot_path)?,
+            Err(e) => {
+                let _ = fs::remove_file(&partial);
+                return Err(e);
+            }
+        }
+        written.push(fastboot_path);
+    }
+    Ok(written)
+}
+
+/// Writes the new OTA zip: payload.bin, payload_properties.txt, metadata
+/// with new property files, the other entries of the old zip in their
+/// original order, then the whole-file signature.
+#[allow(clippy::too_many_arguments)]
+fn write_ota<R: Read + Seek + Send>(
+    work: &Path,
+    state: &State,
+    info: &payload::Payload,
+    reader: &mut R,
+    sources: &[Source],
+    partial: &Path,
+    tmp: &Path,
+    opts: &RepackOptions,
+    key: &Key,
+    log: &mut impl FnMut(&str),
+) -> io::Result<()> {
+    let m = &info.manifest;
+    let bs = m.block_size as u64;
+    let threads = payload::default_threads();
+    let data_path = tmp.join("payload.data");
+    let mut parts = Vec::new();
+    let mut data_len = 0u64;
+    {
+        let mut data = BufWriter::with_capacity(1 << 20, File::create(&data_path)?);
+        for (p, source) in m.partitions.iter().zip(sources) {
+            match source {
+                Source::Keep(_) => {
+                    parts.push(payload::copy_partition(
+                        reader,
+                        info,
+                        p,
+                        &mut data,
+                        &mut data_len,
+                    )?);
+                }
+                Source::Image(path) => {
+                    log(&format!(
+                        "- {}: image -> payload.bin (xz level {})",
+                        p.name, opts.xz_level
+                    ));
+                    let mut image = BufReader::with_capacity(1 << 20, File::open(path)?);
+                    parts.push(payload::encode_image(
+                        &p.name,
+                        &mut image,
+                        bs,
+                        opts.xz_level,
+                        threads,
+                        &mut data,
+                        &mut data_len,
+                    )?);
+                }
+            }
+        }
+        data.flush()?;
+    }
+    let kept = parts.iter().filter(|p| !p.rebuilt).count();
+    log(&format!(
+        "- payload.bin: {} partitions ({} copied unchanged), {} MiB of data",
+        parts.len(),
+        kept,
+        data_len >> 20
+    ));
+    let sig_size = payload::signatures_size(key);
+    let manifest = payload::encode_manifest(m, &parts, data_len, sig_size)?;
+    let payload_size = payload::payload_size(&manifest, data_len, key);
+    let metadata_with_sig = 24 + manifest.len() as u64 + sig_size;
+
+    // entries: the old order, payload_properties.txt after payload.bin,
+    // then files added to rom/
+    let rom_dir = work.join("rom");
+    let mut names: Vec<String> = Vec::new();
+    for n in &state.image_entries {
+        match n.as_str() {
+            "care_map.pb" => {
+                // hashtree ranges of the old images: wrong for rebuilt ones
+                log("- care_map.pb left out (it describes the old images)");
+            }
+            ota::PROPERTIES => {}
+            payload::ENTRY => {
+                names.push(n.clone());
+                names.push(ota::PROPERTIES.to_string());
+            }
+            ota::OTACERT => names.push(n.clone()),
+            _ if rom_dir.join(n).is_file() => names.push(n.clone()),
+            _ => {}
+        }
+    }
+    let mut files = Vec::new();
+    collect_files(&rom_dir, &rom_dir, &mut files)?;
+    for (rel, _) in &files {
+        let generated = [payload::ENTRY, ota::PROPERTIES, "care_map.pb"];
+        if !rel.starts_with(&format!("{}/", PAYLOAD_IMAGES))
+            && !names.contains(rel)
+            && !generated.contains(&rel.as_str())
+        {
+            names.push(rel.clone());
+        }
+    }
+    let dummy = payload::Properties {
+        file_hash: [0; 32],
+        file_size: payload_size,
+        metadata_hash: [0; 32],
+        metadata_size: 24 + manifest.len() as u64,
+        metadata_with_signature: metadata_with_sig,
+    };
+    let old_meta = fs::read_to_string(rom_dir.join(ota::METADATA)).unwrap_or_default();
+    let old_pb = fs::read(rom_dir.join(ota::METADATA_PB)).unwrap_or_default();
+    let cert = key.cert_pem();
+    let stored = zip_options(opts).1;
+    let options = |size: u64, exec: bool| {
+        stored
+            .large_file(size >= u32::MAX as u64)
+            .unix_permissions(if exec { 0o755 } else { 0o644 })
+    };
+    // every entry is stored, so each offset is known before writing; the
+    // metadata lists its own offset, so its size is settled by iterating
+    let (mut meta, mut pb) = (old_meta.clone(), old_pb.clone());
+    let mut plan = Vec::new();
+    let mut offsets = Vec::new();
+    for round in 0.. {
+        plan.clear();
+        for n in &names {
+            let (size, exec) = match n.as_str() {
+                payload::ENTRY => (payload_size, false),
+                ota::PROPERTIES => (dummy.text().len() as u64, false),
+                ota::METADATA => (meta.len() as u64, false),
+                ota::METADATA_PB => (pb.len() as u64, false),
+                ota::OTACERT => (cert.len() as u64, false),
+                _ => {
+                    let md = fs::metadata(rom_dir.join(n))?;
+                    (md.len(), is_executable(&md))
+                }
+            };
+            plan.push((n.clone(), size, options(size, exec)));
+        }
+        offsets = ota::data_offsets(&plan)?;
+        let locate = |name: &str| -> Option<(u64, u64)> {
+            if name == ota::PAYLOAD_METADATA {
+                let i = names.iter().position(|n| n == payload::ENTRY)?;
+                return Some((offsets[i], metadata_with_sig));
+            }
+            let i = names
+                .iter()
+                .position(|n| n == name || n.ends_with(&format!("/{}", name)))?;
+            Some((offsets[i], plan[i].1))
+        };
+        let new_meta = ota::update_metadata(&old_meta, &locate);
+        let new_pb = if old_pb.is_empty() {
+            Vec::new()
+        } else {
+            ota::update_metadata_pb(&old_pb, &locate)?
+        };
+        let settled = new_meta.len() == meta.len() && new_pb.len() == pb.len();
+        meta = new_meta;
+        pb = new_pb;
+        if settled && round > 0 {
+            break;
+        }
+        if round > 8 {
+            return Err(io::Error::other("zip metadata offsets do not settle"));
+        }
+    }
+
+    {
+        let mut zip = ZipWriter::new(BufWriter::with_capacity(1 << 20, File::create(partial)?));
+        let mut props = None;
+        for (name, size, options) in &plan {
+            match name.as_str() {
+                payload::ENTRY => {
+                    log("- Writing payload.bin (signed)");
+                    zip.start_file(name.as_str(), *options).map_err(zip_err)?;
+                    let mut data = BufReader::with_capacity(1 << 20, File::open(&data_path)?);
+                    props = Some(payload::write_payload(
+                        &mut zip, &manifest, &mut data, data_len, key,
+                    )?);
+                }
+                ota::PROPERTIES => {
+                    let text = props
+                        .as_ref()
+                        .ok_or_else(|| io::Error::other("payload.bin not written yet"))?
+                        .text();
+                    ota::write_stored(&mut zip, name, *options, text.as_bytes())?;
+                }
+                ota::METADATA => ota::write_stored(&mut zip, name, *options, meta.as_bytes())?,
+                ota::METADATA_PB => ota::write_stored(&mut zip, name, *options, &pb)?,
+                ota::OTACERT => ota::write_stored(&mut zip, name, *options, cert.as_bytes())?,
+                _ => {
+                    zip.start_file(name.as_str(), *options).map_err(zip_err)?;
+                    let n = io::copy(&mut File::open(rom_dir.join(name))?, &mut zip)?;
+                    if n != *size {
+                        return Err(io::Error::other(format!("{} changed while writing", name)));
+                    }
+                }
+            }
+        }
+        zip.finish().map_err(zip_err)?.flush()?;
+    }
+    fs::remove_file(&data_path)?;
+
+    // the property files must point at the entries
+    let mut check = ZipArchive::new(BufReader::new(File::open(partial)?)).map_err(zip_err)?;
+    for (i, (name, _, _)) in plan.iter().enumerate() {
+        let entry = check.by_name(name).map_err(zip_err)?;
+        if entry.data_start() != Some(offsets[i]) {
+            return Err(io::Error::other(format!(
+                "{}: planned at {}, written at {:?}",
+                name,
+                offsets[i],
+                entry.data_start()
+            )));
+        }
+    }
+    drop(check);
+    log("- Signing the zip");
+    sign::sign_zip(partial, key)
+}
+
+/// Writes a fastboot ROM from the images of a payload: the images and
+/// flash-all.sh / flash-all.bat.
+fn write_payload_fastboot(
+    m: &payload::Manifest,
+    sources: &[Source],
+    partial: &Path,
+    log: &mut impl FnMut(&str),
+) -> io::Result<()> {
+    let logical: std::collections::HashSet<&str> = m
+        .groups
+        .iter()
+        .flat_map(|g| &g.partitions)
+        .map(|p| factory::strip_slot(p))
+        .collect();
+    let (logical_parts, firmware): (Vec<String>, Vec<String>) = m
+        .partitions
+        .iter()
+        .map(|p| p.name.clone())
+        .partition(|n| logical.contains(n.as_str()));
+    let (sh, bat) = ota::flash_scripts(&firmware, &logical_parts, m.snapshot_enabled);
+    let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+    let mut zip = ZipWriter::new(BufWriter::with_capacity(1 << 20, File::create(partial)?));
+    zip.start_file("flash-all.sh", stored.unix_permissions(0o755))
+        .map_err(zip_err)?;
+    zip.write_all(sh.as_bytes())?;
+    zip.start_file("flash-all.bat", stored.unix_permissions(0o644))
+        .map_err(zip_err)?;
+    zip.write_all(bat.as_bytes())?;
+    log("- Writing the fastboot ROM (images + flash-all.sh/.bat)");
+    for (p, source) in m.partitions.iter().zip(sources) {
+        add_file(&mut zip, &format!("{}.img", p.name), source.path(), stored)?;
+    }
     zip.finish().map_err(zip_err)?.flush()?;
     Ok(())
 }

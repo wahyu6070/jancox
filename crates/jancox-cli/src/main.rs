@@ -27,8 +27,9 @@ fn usage() {
     out!("      Make input/, output/ and jancox.prop (brotli/zip levels) if missing");
     out!("  unpack [rom.zip] [-w workdir]");
     out!("      Unpack a ROM zip (default: <workdir>/input/*.zip or input.zip) into editable folders");
-    out!("  repack [-w workdir] [-o out.zip] [-b brotli_quality] [-z zip_level]");
+    out!("  repack [-w workdir] [-o out.zip] [-b brotli_quality] [-z zip_level] [-t type]");
     out!("      Build a new ROM zip in <workdir>/output/ (default: jancox.prop, else -b 1 -z 1)");
+    out!("      -t: what a payload.bin ROM becomes: payload (OTA zip), fastboot or both");
     out!("  cleanup [-w workdir] [--all]");
     out!("      Remove the unpacked files (--all: also <workdir>/output); input/ is kept\n");
     out!("Tools:");
@@ -465,7 +466,7 @@ fn unpack(args: &[String]) -> Result<(), String> {
 
 fn repack(args: &[String]) -> Result<(), String> {
     const USAGE: &str =
-        "usage: jancox repack [-w workdir] [-o out.zip] [-b brotli_quality] [-z zip_level]";
+        "usage: jancox repack [-w workdir] [-o out.zip] [-b brotli_quality] [-z zip_level] [-t payload|fastboot|both]";
     let (work, rest) = workdir(args, USAGE)?;
     let mut opts = rom::load_config(&work).map_err(|e| format!("repack failed: {}", e))?;
     let mut output = None;
@@ -484,18 +485,20 @@ fn repack(args: &[String]) -> Result<(), String> {
             "-z" | "--zip-level" => {
                 opts.zip_level = value()?.parse().map_err(|_| USAGE.to_string())?
             }
+            "-t" | "--type" => {
+                opts.payload_output =
+                    rom::PayloadOutput::parse(&value()?).ok_or_else(|| USAGE.to_string())?
+            }
             _ => return Err(format!("unexpected argument: {}\n{}", arg, USAGE)),
         }
     }
     let start = Instant::now();
-    let zip = rom::repack(&work, output.as_deref(), opts, |msg| out!("{}", msg))
+    let zips = rom::repack(&work, output.as_deref(), opts, |msg| out!("{}", msg))
         .map_err(|e| format!("repack failed: {}", e))?;
-    out!(
-        "- Done in {:.1}s: {} ({} bytes)",
-        start.elapsed().as_secs_f64(),
-        zip.display(),
-        file_size(&zip)
-    );
+    out!("- Done in {:.1}s:", start.elapsed().as_secs_f64());
+    for zip in &zips {
+        out!("  {} ({} bytes)", zip.display(), file_size(zip));
+    }
     Ok(())
 }
 

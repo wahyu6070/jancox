@@ -125,6 +125,26 @@ impl Writer {
     pub fn message(&mut self, field: u32, m: &Writer) -> &mut Self {
         self.bytes(field, &m.buf)
     }
+
+    pub fn fixed32(&mut self, field: u32, v: u32) -> &mut Self {
+        self.raw_varint((field as u64) << 3 | 5);
+        self.buf.extend_from_slice(&v.to_le_bytes());
+        self
+    }
+
+    /// Writes a field as it was read.
+    pub fn value(&mut self, field: u32, v: &Value) -> &mut Self {
+        match *v {
+            Value::Varint(n) => self.varint(field, n),
+            Value::Bytes(b) => self.bytes(field, b),
+            Value::Fixed32(n) => self.fixed32(field, n),
+            Value::Fixed64(n) => {
+                self.raw_varint((field as u64) << 3 | 1);
+                self.buf.extend_from_slice(&n.to_le_bytes());
+                self
+            }
+        }
+    }
 }
 
 #[cfg(test)]

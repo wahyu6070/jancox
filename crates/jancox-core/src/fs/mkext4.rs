@@ -5,8 +5,11 @@
 //! `ext_attr filetype extent sparse_super large_file dir_nlink extra_isize`.
 //! Every file gets contiguous blocks where possible; xattrs
 //! (`security.selinux`, `security.capability`) go in the inode when they
-//! fit, otherwise in one xattr block.
+//! fit, otherwise in one xattr block. With `dedup`, identical file blocks
+//! are stored once and the image gets `shared_blocks` (read-only), as
+//! e2fsdroid does for Android 10+ images.
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -29,6 +32,7 @@ const RO_COMPAT_SPARSE_SUPER: u32 = 0x1;
 const RO_COMPAT_LARGE_FILE: u32 = 0x2;
 const RO_COMPAT_DIR_NLINK: u32 = 0x20;
 const RO_COMPAT_EXTRA_ISIZE: u32 = 0x40;
+const RO_COMPAT_SHARED_BLOCKS: u32 = 0x4000;
 const FLAG_EXTENTS: u32 = 0x80000;
 const XATTR_MAGIC: u32 = 0xEA02_0000;
 const XATTR_INDEX_SECURITY: u8 = 6;
@@ -90,6 +94,8 @@ pub struct Params {
     pub last_mounted: String,
     /// Used for every inode time and the superblock times.
     pub timestamp: u32,
+    /// Store identical file blocks once (`shared_blocks`).
+    pub dedup: bool,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -526,6 +532,7 @@ pub fn write_image(out: &Path, root: &Node, p: &Params) -> io::Result<Stats> {
     }
     let bs = l.bs as usize;
     let mut alloc = Allocator::new(&l);
+    let mut dedup = p.dedup.then(Dedup::new);
 
     let mut img = File::create(out)?;
     img.set_len(l.blocks * l.bs)?;
@@ -557,8 +564,11 @@ pub fn write_image(out: &Path, root: &Node, p: &Params) -> io::Result<Stats> {
                 (tree, blocks, data.len() as u64)
             }
             NodeKind::File { source, size } => {
-                let extents = write_file(&mut img, &mut alloc, source, *size, l.bs)
-                    .map_err(|e| with_path(e, source))?;
+                let extents = match &mut dedup {
+                    Some(d) => write_file_dedup(&mut img, &mut alloc, d, source, *size, l.bs),
+                    None => write_file(&mut img, &mut alloc, source, *size, l.bs),
+                }
+                .map_err(|e| with_path(e, source))?;
                 let (tree, blocks) = extent_tree(&mut img, &mut alloc, &extents, l.bs)?;
                 (tree, blocks, *size)
             }
@@ -654,10 +664,15 @@ pub fn write_image(out: &Path, root: &Node, p: &Params) -> io::Result<Stats> {
     put16(&mut sb, 0x58, INODE_SIZE as u16);
     put32(&mut sb, 0x5C, COMPAT_EXT_ATTR);
     put32(&mut sb, 0x60, INCOMPAT_FILETYPE | INCOMPAT_EXTENTS);
+    let shared = if p.dedup { RO_COMPAT_SHARED_BLOCKS } else { 0 };
     put32(
         &mut sb,
         0x64,
-        RO_COMPAT_SPARSE_SUPER | RO_COMPAT_LARGE_FILE | RO_COMPAT_DIR_NLINK | RO_COMPAT_EXTRA_ISIZE,
+        RO_COMPAT_SPARSE_SUPER
+            | RO_COMPAT_LARGE_FILE
+            | RO_COMPAT_DIR_NLINK
+            | RO_COMPAT_EXTRA_ISIZE
+            | shared,
     );
     sb[0x68..0x78].copy_from_slice(&p.uuid);
     let name = p.volume_name.as_bytes();
@@ -794,6 +809,90 @@ fn write_file(
         logical += blocks as u64;
         left -= n as u64;
     }
+    Ok(extents)
+}
+
+/// Block contents (first 16 bytes of the SHA-256 of the zero-padded
+/// block) -> block number, for `shared_blocks`.
+type Dedup = HashMap<[u8; 16], u64>;
+
+fn block_key(b: &[u8], bs: usize) -> [u8; 16] {
+    use sha2::{Digest, Sha256};
+    const ZEROS: [u8; 4096] = [0; 4096];
+    let mut h = Sha256::new();
+    h.update(b);
+    // a short last block is zero-padded on disk
+    h.update(&ZEROS[..bs - b.len()]);
+    h.finalize()[..16].try_into().unwrap()
+}
+
+/// Like `write_file`, but a block whose content is already in the image
+/// points at the existing copy.
+fn write_file_dedup(
+    img: &mut File,
+    alloc: &mut Allocator,
+    dedup: &mut Dedup,
+    source: &Path,
+    size: u64,
+    bs: u64,
+) -> io::Result<Vec<(u64, u64, u64)>> {
+    const CHUNK_BLOCKS: usize = 256;
+    let bs_us = bs as usize;
+    let mut src = File::open(source)?;
+    let mut buf = vec![0u8; CHUNK_BLOCKS * bs_us];
+    let mut extents: Vec<(u64, u64, u64)> = Vec::new();
+    // new blocks waiting to be written: first block number and bytes
+    let mut pending: (u64, Vec<u8>) = (0, Vec::with_capacity(buf.len()));
+    let flush = |img: &mut File, pending: &mut (u64, Vec<u8>)| -> io::Result<()> {
+        if !pending.1.is_empty() {
+            write_at(img, pending.0 * bs, &pending.1)?;
+            pending.1.clear();
+        }
+        Ok(())
+    };
+    let mut logical = 0u64;
+    let mut left = size;
+    while left > 0 {
+        let n = left.min(buf.len() as u64) as usize;
+        src.read_exact(&mut buf[..n]).map_err(|e| {
+            if e.kind() == io::ErrorKind::UnexpectedEof {
+                io::Error::new(e.kind(), "file shrank while building")
+            } else {
+                e
+            }
+        })?;
+        for (k, block) in buf[..n].chunks(bs_us).enumerate() {
+            let lg = logical + k as u64;
+            if is_zero(block) {
+                continue;
+            }
+            let key = block_key(block, bs_us);
+            let phys = match dedup.get(&key) {
+                Some(&phys) => phys,
+                None => {
+                    let phys = alloc.alloc(1)?[0].0;
+                    dedup.insert(key, phys);
+                    if pending.0 + (pending.1.len() / bs_us) as u64 != phys
+                        || pending.1.len() >= buf.len()
+                    {
+                        flush(img, &mut pending)?;
+                        pending.0 = phys;
+                    }
+                    pending.1.extend_from_slice(block);
+                    // keep whole blocks so the next one lands in place
+                    pending.1.resize(pending.1.len().div_ceil(bs_us) * bs_us, 0);
+                    phys
+                }
+            };
+            match extents.last_mut() {
+                Some(e) if e.0 + e.2 == lg && e.1 + e.2 == phys => e.2 += 1,
+                _ => extents.push((lg, phys, 1)),
+            }
+        }
+        logical += n.div_ceil(bs_us) as u64;
+        left -= n as u64;
+    }
+    flush(img, &mut pending)?;
     Ok(extents)
 }
 
@@ -957,11 +1056,77 @@ pub fn blocks_for(data: u64, inodes: u32, bs: u64) -> io::Result<u64> {
     }
 }
 
+/// Blocks the files of `root` take with `shared_blocks`: every file is read
+/// and only distinct non-zero blocks count, plus the extent leaf blocks the
+/// sharing makes necessary.
+fn dedup_file_blocks(root: &Node, bs: u64) -> io::Result<u64> {
+    let bs_us = bs as usize;
+    let per_leaf = (bs - 12) / 12;
+    let mut seen: HashMap<[u8; 16], u64> = HashMap::new();
+    let mut total = 0u64;
+    let mut buf = vec![0u8; 256 * bs_us];
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        let (source, size) = match &node.kind {
+            NodeKind::Dir(children) => {
+                stack.extend(children.iter());
+                continue;
+            }
+            NodeKind::File { source, size } => (source, *size),
+            NodeKind::Symlink(_) => continue,
+        };
+        let mut src = File::open(source).map_err(|e| with_path(e, source))?;
+        // extents as the writer would make them: new blocks get the next
+        // number, shared ones the number of the first copy
+        let mut extents = 0u64;
+        let mut last: Option<(u64, u64)> = None; // (logical, physical)
+        let mut logical = 0u64;
+        let mut left = size;
+        while left > 0 {
+            let n = left.min(buf.len() as u64) as usize;
+            src.read_exact(&mut buf[..n])
+                .map_err(|e| with_path(e, source))?;
+            for (k, block) in buf[..n].chunks(bs_us).enumerate() {
+                let lg = logical + k as u64;
+                if is_zero(block) {
+                    continue;
+                }
+                let next = seen.len() as u64;
+                let phys = *seen.entry(block_key(block, bs_us)).or_insert(next);
+                if phys == next {
+                    total += 1;
+                }
+                if last != Some((lg.wrapping_sub(1), phys.wrapping_sub(1))) {
+                    extents += 1;
+                }
+                last = Some((lg, phys));
+            }
+            logical += n.div_ceil(bs_us) as u64;
+            left -= n as u64;
+        }
+        if extents > 4 {
+            let leaves = extents.div_ceil(per_leaf);
+            total += leaves
+                + if leaves > 4 {
+                    leaves.div_ceil(per_leaf)
+                } else {
+                    0
+                };
+        }
+    }
+    Ok(total)
+}
+
 /// Blocks needed for `root` (data, directories, extent leaves and xattr
-/// blocks), without filesystem metadata. Used to pick an image size.
-pub fn data_blocks_needed(root: &Node, bs: u64) -> io::Result<(u64, u32)> {
+/// blocks), without filesystem metadata. Used to pick an image size. With
+/// `dedup` the files are read to count their distinct blocks.
+pub fn data_blocks_needed(root: &Node, bs: u64, dedup: bool) -> io::Result<(u64, u32)> {
     let flat = flatten(root)?;
-    let mut blocks = 0u64;
+    let mut blocks = if dedup {
+        dedup_file_blocks(root, bs)?
+    } else {
+        0
+    };
     for (ino, f) in flat.iter().enumerate() {
         let Some(f) = f else { continue };
         let node = f.node;
@@ -974,6 +1139,7 @@ pub fn data_blocks_needed(root: &Node, bs: u64) -> io::Result<(u64, u32)> {
                 };
                 dir_blocks(ino as u32, f.parent, &f.children, bs as usize, min).len() as u64 / bs
             }
+            NodeKind::File { .. } if dedup => 0,
             NodeKind::File { size, .. } => size.div_ceil(bs),
             NodeKind::Symlink(t) if t.len() >= 60 => 1,
             NodeKind::Symlink(_) => 0,
@@ -995,6 +1161,92 @@ pub fn data_blocks_needed(root: &Node, bs: u64) -> io::Result<(u64, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_blocks() {
+        use crate::fs::ext4::Ext4;
+        use crate::fs::Filesystem;
+        let dir = std::env::temp_dir().join(format!("jancox-dedup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // a: blocks A B 0 A, b: B A + a short tail equal to C padded
+        let blk = |c: u8| vec![c; 4096];
+        let a: Vec<u8> = [blk(1), blk(2), blk(0), blk(1)].concat();
+        let mut b: Vec<u8> = [blk(2), blk(1), blk(3)].concat();
+        b.truncate(2 * 4096 + 100);
+        std::fs::write(dir.join("a"), &a).unwrap();
+        std::fs::write(dir.join("b"), &b).unwrap();
+        let file = |name: &str, len: usize| Node {
+            name: name.as_bytes().to_vec(),
+            kind: NodeKind::File {
+                source: dir.join(name),
+                size: len as u64,
+            },
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            selinux: None,
+            capabilities: None,
+        };
+        let lost = Node {
+            name: b"lost+found".to_vec(),
+            kind: NodeKind::Dir(Vec::new()),
+            mode: 0o700,
+            uid: 0,
+            gid: 0,
+            selinux: None,
+            capabilities: None,
+        };
+        let root = Node {
+            name: Vec::new(),
+            kind: NodeKind::Dir(vec![lost, file("a", a.len()), file("b", b.len())]),
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+            selinux: None,
+            capabilities: None,
+        };
+        let mut used = Vec::new();
+        for dedup in [false, true] {
+            let params = Params {
+                block_size: 4096,
+                blocks: 256,
+                inodes: 16,
+                reserved_blocks: 0,
+                uuid: [1; 16],
+                hash_seed: [2; 16],
+                volume_name: "t".into(),
+                last_mounted: "/t".into(),
+                timestamp: 0,
+                dedup,
+            };
+            let img = dir.join("img");
+            let st = write_image(&img, &root, &params).unwrap();
+            used.push(st.used_blocks);
+            let mut fs = Ext4::open(File::open(&img).unwrap()).unwrap();
+            for (name, node) in fs.read_dir(fs.root()).unwrap() {
+                let want = match &name[..] {
+                    b"a" => &a,
+                    b"b" => &b,
+                    _ => continue,
+                };
+                let mut got = Vec::new();
+                fs.read_file(node, &mut got).unwrap();
+                assert_eq!(&got, want);
+            }
+            assert_eq!(
+                fs.info()
+                    .iter()
+                    .any(|(k, v)| k == "features" && v.contains("shared_blocks")),
+                dedup
+            );
+        }
+        // without sharing: a has 3 blocks, b 3; with it: A, B, C
+        assert_eq!(used[0] - used[1], 3);
+        let (with, _) = data_blocks_needed(&root, 4096, true).unwrap();
+        let (without, _) = data_blocks_needed(&root, 4096, false).unwrap();
+        assert_eq!(without - with, 4);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn xattr_hash_by_hand() {

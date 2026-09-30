@@ -7,7 +7,7 @@ Jancox is one `jancox` binary, written in Rust, with no dependencies. Unpacking 
 - Unpack a ROM zip into folders you can edit:
   - recovery ROMs (`*.new.dat.br` / `*.new.dat` + `*.transfer.list`)
   - fastboot ROMs such as Pixel factory images (`<device>-<build>/image-*.zip`, flashed with `flash-all.sh`), or an `image-*.zip` on its own
-  - A/B OTA zips with `payload.bin` (full OTAs; unpack only for now)
+  - A/B OTA zips with `payload.bin` (full OTAs), repacked as a new signed OTA zip and/or a fastboot ROM
 - ext4 and EROFS partitions.
 - Repack the folders into a new ROM zip of the same kind.
 - Keeps owners, permissions, SELinux labels and capabilities in metadata files, so it works on `/sdcard` and on Windows too.
@@ -118,7 +118,20 @@ Full OTA zips with a `payload.bin` (e.g. ASUS, Xiaomi, OnePlus stock ROMs) unpac
 - The logical partitions (system, system_ext, product, vendor, odm, ...) go to `partition/`.
 - The other images (boot, vendor_boot, dtbo, vbmeta, modem, bootloader, ...) go to `rom/payload/<name>.img`.
 - Every image is checked against the SHA-256 in the payload.
-- `repack` does not support these ROMs yet.
+
+`jancox repack` makes what `payload.output` in `jancox.prop` says (or `-t`):
+
+| `payload.output` | Result |
+|---|---|
+| `payload` (default) | `output/NewROM-<date>.zip`: a new OTA zip with `payload.bin`. Flash it in a custom recovery (TWRP, OrangeFox, ...) or with `adb sideload`. |
+| `fastboot` | `output/NewROM-<date>.zip` with all images and `flash-all.sh` / `flash-all.bat`: firmware in the bootloader, the logical partitions in fastbootd. |
+| `both` | both zips (`NewROM-<date>.zip` and `NewROM-<date>-fastboot.zip`). |
+
+- The logical partitions are rebuilt. An image in `rom/payload/` that you replaced (e.g. a patched `boot.img`) is encoded again. Unchanged images are copied from the old payload as they are.
+- `vbmeta.img` gets the disable-verity/verification flags, so the device must be unlocked.
+- `payload.bin` and the zip are signed with the AOSP test key. TWRP, OrangeFox and other test-keys recoveries accept it; stock recoveries only take the vendor's key. Set `sign.key` / `sign.cert` in `jancox.prop` to sign with your own key.
+- `payload.xz_level` (0-9, default 1) sets the xz level of the rebuilt partitions: 6 makes a ~7% smaller zip but is about 4x slower.
+- Images made with block sharing (`shared_blocks`, most Android 10+ ext4 images) are rebuilt with it, so they keep their size.
 
 `jancox payload ota.zip -o images/` only dumps the images (like payload-dumper); `-p boot,vendor_boot` picks some, `-l` lists them.
 
@@ -127,7 +140,7 @@ Full OTA zips with a `payload.bin` (e.g. ASUS, Xiaomi, OnePlus stock ROMs) unpac
 ```
 jancox init     [-w workdir]
 jancox unpack   [rom.zip] [-w workdir]
-jancox repack   [-w workdir] [-o out.zip] [-b brotli_quality] [-z zip_level]
+jancox repack   [-w workdir] [-o out.zip] [-b brotli_quality] [-z zip_level] [-t payload|fastboot|both]
 jancox cleanup  [-w workdir] [--all]
 
 jancox extract  <image> [-o outdir] [-p name]           ext4/EROFS image -> folder + metadata
@@ -143,7 +156,7 @@ jancox brotli   [-d] [-q quality] [-w window] [-o output] <file>
 ## Limitations
 
 - EROFS images with compressed files (lz4, lzma, ...) can't be read yet; uncompressed EROFS (as in Pixel factory images) works.
-- `payload.bin` ROMs unpack, but don't repack yet; incremental OTAs are refused. `super.img` is not supported yet.
+- Incremental OTAs (payload.bin patches) are refused. `super.img` is not supported yet.
 - A repacked partition no longer matches its dm-verity hashtree / AVB data, so the ROM only boots with verification disabled (as with older Jancox versions). For fastboot ROMs, repack sets the "disable verity + verification" flags in `vbmeta.img`; this needs an unlocked bootloader, and the first flash with these flags needs a data wipe (`flash-all.sh` wipes by default).
 - Paths with spaces can't be stored in `fs_config` and get a warning.
 - Hard links become separate files.

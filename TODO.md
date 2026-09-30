@@ -18,29 +18,22 @@ Uncompressed EROFS is read (`fs/erofs.rs`) and written (`fs/mkerofs.rs`), and wa
 
 ## payload.bin ROMs
 
-A/B OTA zips (`payload.bin` + `payload_properties.txt`). Unpack works (`payload.rs`, `rom.rs`, `jancox payload`), checked with the ASUS ROG Phone 5 full OTA (ext4, 29 partitions, all SHA-256 match). Repack is refused for now.
+A/B OTA zips (`payload.bin` + `payload_properties.txt`). Unpack and repack work (`payload.rs`, `sign.rs`, `ota.rs`, `rom.rs`), checked with the ASUS ROG Phone 5 full OTA: all 29 SHA-256 match on unpack; the repacked payload passes AOSP `paycheck.py --check` with the test key, the zip signature verifies (`openssl cms`), and unpacking it again gives the same trees and images. Not flashed on a device yet.
 
 Most payload ROMs from Xiaomi, OnePlus and others ship lz4 EROFS. Until compressed EROFS works, those unpack only as far as the images: extraction fails.
 
-### Unpack: open points
+### Open points
 
 - Incremental OTAs (SOURCE_COPY, SOURCE_BSDIFF, BROTLI_BSDIFF, PUFFDIFF, ZUCCHINI, LZ4DIFF_*) are refused; they need the old images.
 - A bare `payload.bin` works with `jancox payload`, but `unpack` only takes zips.
 - The logical partitions are dumped to `tmp/` before extraction, which needs their size in free space (system is 3.4 GB on the ROG Phone 5). Reading them in place would need a reader over the operations.
 - Only an ASUS payload was tested (REPLACE, REPLACE_XZ, REPLACE_BZ). ZSTD is covered by the decoder but untested on a real ROM.
-
-### Repack, in this order
-
-1. **Fastboot ROM** (no signing, most code exists): rebuilt images + untouched images + a `super_empty.img` made from the manifest's `dynamic_partition_metadata` (groups, max sizes, partitions) + `flash-all.sh`/`.bat`. Reuses `mkerofs`, `factory::check_groups` and the vbmeta patch.
-2. **super.img** (see below): the same images in one lpmake-like `super.img`.
-3. **New payload.bin** (flashable in recovery):
-   - Manifest via a hand-written protobuf encoder: `block_size`, `minor_version = 0` (full), `dynamic_partition_metadata`, and per partition `new_partition_info` (size + SHA-256) and its operations.
-   - Rebuilt partitions: 2 MiB chunks as REPLACE_XZ, falling back to REPLACE when xz doesn't shrink the chunk (as `full_update_generator.cc` does). ZSTD is faster but only newer `update_engine` versions read it. A pure-Rust xz encoder compresses worse; `liblzma` (C) is better but must cross-compile.
-   - Untouched partitions: copy their operations and data blobs from the old payload as they are (no recompression).
-   - `vbmeta.img` in the payload: set the disable-verity/verification flags (as for fastboot ROMs).
-   - `payload_properties.txt` (`FILE_HASH`, `FILE_SIZE`, `METADATA_HASH`, `METADATA_SIZE`, base64 SHA-256) and `META-INF/com/android/metadata` + `metadata.pb`.
-   - Signing: RSA-2048 PKCS#1 v1.5 + SHA-256 over the metadata and the whole payload, plus the zip signature, with the AOSP test keys (own code or the `rsa` crate). Stock recoveries reject it (OEM keys). Custom recoveries (TWRP, OrangeFox, LineageOS recovery) take test keys, skip the check, or ask "install anyway".
-   - Test: AOSP `scripts/update_payload/checker.py` must accept our payload. Compare with `delta_generator` from `otatools.zip` (Linux x86_64 only, so as a reference, not a dependency).
+- Repack rebuilds every logical partition even when unchanged (like fastboot ROMs); an untouched partition could keep its old operations and hashtree.
+- Repack writes the blobs to `tmp/payload.data` first (the manifest, which comes first, needs their offsets and hashes): free space for the payload twice.
+- Repack encodes with xz only. ZSTD is faster but only newer `update_engine` versions read it. AOSP also uses the ARM Thumb BCJ filter (a bit smaller).
+- Virtual A/B COW estimates of rebuilt partitions are set on the safe side (`estimate_cow_size` = image size + headers), not computed.
+- `care_map.pb` is left out of a repacked OTA (it lists the hashtree ranges of the old images).
+- Fastboot output: the scripts flash the current slot only; a super group that is too full for fastbootd isn't handled.
 
 ### References
 
@@ -81,11 +74,11 @@ The super partition image with all logical partitions (in some fastboot ROMs, an
 ## ext4 builder: open points
 
 - Directories are linear (no `dir_index` htree); fine for Android sizes, slower lookups in huge directories.
-- No `shared_blocks` dedup, no hard links (see below).
+- No hard links (see below). `shared_blocks` dedup is done when the original image had it.
 
 ## ext4 extractor: open points
 
 - Android sparse images (`simg`) are rejected; only raw images are read. Could read them through the sparse reader in img2sdat.
 - Hard links are extracted as separate copies and not recorded.
 - Paths with whitespace can't be written to fs_config / file_contexts; they only get a warning.
-- `shared_blocks` (Android 10+ deduplicated ext4) is untested: no tool here creates such images.
+- `shared_blocks` (Android 10+ deduplicated ext4) images read fine (ASUS ROG Phone 5 system/vendor/product).

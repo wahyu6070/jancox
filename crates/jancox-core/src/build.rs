@@ -495,25 +495,26 @@ pub fn build(
         return Ok(sum);
     }
 
-    // ext4 image parameters
-    let (data, used_inodes) = mkext4::data_blocks_needed(&root, bs)?;
+    // ext4 image parameters; images made with block sharing (Android 10+)
+    // are rebuilt with it, or they don't fit their old size
+    let dedup = info
+        .get("features")
+        .is_some_and(|f| f.split_whitespace().any(|x| x == "shared_blocks"));
+    let (data, used_inodes) = mkext4::data_blocks_needed(&root, bs, dedup)?;
     let auto_inodes = (used_inodes as u64 + used_inodes as u64 / 50 + 64) as u32;
+    // a given size keeps the old inode count unless more are needed
+    let fixed_inodes = num("inodes").map_or(auto_inodes, |i| (i as u32).max(used_inodes + 1));
     let (blocks, inodes) = match (size, num("blocks")) {
-        (Size::Bytes(b), _) => (
-            b / bs,
-            num("inodes")
-                .map_or(auto_inodes, |i| i as u32)
-                .max(auto_inodes),
-        ),
-        (Size::Original, Some(b)) => (
-            b,
-            num("inodes")
-                .map_or(auto_inodes, |i| i as u32)
-                .max(auto_inodes),
-        ),
+        (Size::Bytes(b), _) => (b / bs, fixed_inodes),
+        (Size::Original, Some(b)) => (b, fixed_inodes),
         (Size::Auto, _) | (Size::Original, None) => {
-            // content + 2% for extent leaves and growth
-            let with_margin = data + data / 50 + 256;
+            // with shared blocks the count is exact: small margin only;
+            // else 2% for extent leaves and growth
+            let with_margin = if dedup {
+                data + data / 500 + 256
+            } else {
+                data + data / 50 + 256
+            };
             (
                 mkext4::blocks_for(with_margin, auto_inodes, bs)?,
                 auto_inodes,
@@ -534,6 +535,7 @@ pub fn build(
             .unwrap_or_else(|| part.to_string()),
         last_mounted: mount.clone(),
         timestamp: num("created").map_or(DEFAULT_TIMESTAMP, |t| t as u32),
+        dedup,
     };
     log(&format!(
         "- Image: {} blocks of {} bytes ({} MiB), {} blocks of content",

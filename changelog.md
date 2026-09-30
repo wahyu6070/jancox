@@ -2,8 +2,11 @@
 ## Unreleased
 - EROFS: own extractor (uncompressed images: flat, inline tail and chunk-based files, shared/inline xattrs) and image builder; partitions are rebuilt with the filesystem they came with
 - Fastboot ROMs: Pixel factory images (`<device>-<build>/image-*.zip`) and plain `image-*.zip` unpack and repack. The logical partitions from `super_empty.img` are read straight out of the zip; repack checks the super group size and disables dm-verity/verification in `vbmeta.img`
-- payload.bin ROMs (A/B OTA zips, full OTAs): unpack dumps the images straight from the zip (REPLACE, REPLACE_XZ, REPLACE_BZ, ZSTD, ZERO; decoded in parallel, SHA-256 checked) and extracts the logical partitions; the other images go to `rom/payload/`. Repack is not supported yet
+- payload.bin ROMs (A/B OTA zips, full OTAs): unpack dumps the images straight from the zip (REPLACE, REPLACE_XZ, REPLACE_BZ, ZSTD, ZERO; decoded in parallel, SHA-256 checked) and extracts the logical partitions; the other images go to `rom/payload/`
 - New command: `jancox payload` dumps the images of a payload.bin or OTA zip
+- payload.bin ROMs repack: a new OTA zip (signed payload.bin with the AOSP test key or your own, payload_properties.txt, metadata with new property files, whole-zip signature) and/or a fastboot ROM with flash-all.sh/.bat. Pick with `payload.output=payload|fastboot|both` in `jancox.prop` (default payload) or `repack -t`. Unchanged images are copied from the old payload; vbmeta gets the disable-verity flags
+- ext4: images with `shared_blocks` (Android 10+ block sharing) are rebuilt with it, so an unchanged partition keeps its size
+- ext4: a rebuild at the original size keeps the original inode count
 - Recovery ROMs with uncompressed EROFS inside `*.new.dat.br` work too. Compressed EROFS (lz4/lzma, used by most non-Pixel ROMs) is not supported yet
 
 ## 3.0.0 25-09-2026

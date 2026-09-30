@@ -25,6 +25,7 @@ use zip::ZipArchive;
 use crate::factory::{self, Group};
 use crate::fs::{invalid, Window};
 use crate::proto::{self, Writer};
+use crate::sign::Key;
 
 pub const MAGIC: &[u8; 4] = b"CrAU";
 /// Name of the payload in an OTA zip.
@@ -95,6 +96,8 @@ pub struct PartitionUpdate {
     /// Incremental OTAs describe the old partition too.
     pub has_old_info: bool,
     pub ops: Vec<Operation>,
+    /// The PartitionUpdate as read, for the fields a new payload keeps.
+    pub raw: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -109,6 +112,8 @@ pub struct Manifest {
     pub groups: Vec<Group>,
     /// Virtual A/B (`snapshot_enabled`).
     pub snapshot_enabled: bool,
+    /// The manifest as read, for the fields a new payload keeps.
+    pub raw: Vec<u8>,
 }
 
 fn extent(msg: &[u8]) -> io::Result<Extent> {
@@ -156,7 +161,10 @@ fn partition_info(msg: &[u8]) -> io::Result<(u64, Vec<u8>)> {
 }
 
 fn partition_update(msg: &[u8]) -> io::Result<PartitionUpdate> {
-    let mut p = PartitionUpdate::default();
+    let mut p = PartitionUpdate {
+        raw: msg.to_vec(),
+        ..PartitionUpdate::default()
+    };
     for (f, v) in proto::fields(msg)? {
         match f {
             1 => p.name = v.as_string()?,
@@ -199,6 +207,7 @@ impl Manifest {
     pub fn parse(msg: &[u8]) -> io::Result<Manifest> {
         let mut m = Manifest {
             block_size: 4096,
+            raw: msg.to_vec(),
             ..Manifest::default()
         };
         for (f, v) in proto::fields(msg)? {
@@ -381,6 +390,81 @@ fn decode(op: &Operation, data: Vec<u8>, block_size: u64) -> io::Result<Vec<u8>>
     Ok(out)
 }
 
+/// Runs `work` on `threads` threads over the jobs `produce` returns (until
+/// `None`) and hands the results to `consume` in job order. At most
+/// `2 * threads` jobs are in memory at once.
+fn pipeline<J: Send, O: Send>(
+    threads: usize,
+    mut produce: impl FnMut() -> io::Result<Option<J>> + Send,
+    work: impl Fn(J) -> io::Result<O> + Sync,
+    mut consume: impl FnMut(O) -> io::Result<()>,
+) -> io::Result<()> {
+    let threads = threads.max(1);
+    let in_flight = threads * 2;
+    let (job_tx, job_rx) = mpsc::sync_channel::<(usize, J)>(threads);
+    // shared by the workers; dropped with the last one, which stops the
+    // producer when they quit early
+    let job_rx = Arc::new(Mutex::new(job_rx));
+    let (res_tx, res_rx) = mpsc::channel::<(usize, io::Result<O>)>();
+    // the producer takes a credit per job, the consumer gives it back
+    let (credit_tx, credit_rx) = mpsc::sync_channel::<()>(in_flight);
+    for _ in 0..in_flight {
+        credit_tx.send(()).unwrap();
+    }
+    let work = &work;
+    std::thread::scope(|s| -> io::Result<()> {
+        let producer = s.spawn(move || -> io::Result<()> {
+            for i in 0.. {
+                if credit_rx.recv().is_err() {
+                    break;
+                }
+                let Some(job) = produce()? else { break };
+                if job_tx.send((i, job)).is_err() {
+                    break;
+                }
+            }
+            Ok(())
+        });
+        for _ in 0..threads {
+            let res_tx = res_tx.clone();
+            let job_rx = Arc::clone(&job_rx);
+            s.spawn(move || loop {
+                let job = job_rx.lock().unwrap().recv();
+                let Ok((i, job)) = job else { break };
+                if res_tx.send((i, work(job))).is_err() {
+                    break;
+                }
+            });
+        }
+        drop(res_tx);
+        drop(job_rx);
+
+        let mut pending = BTreeMap::new();
+        let mut next = 0;
+        let consumed = (|| -> io::Result<()> {
+            // ends when the producer is done and all workers have quit
+            while let Ok((i, out)) = res_rx.recv() {
+                pending.insert(i, out);
+                while let Some(out) = pending.remove(&next) {
+                    consume(out?)?;
+                    next += 1;
+                    let _ = credit_tx.send(());
+                }
+            }
+            Ok(())
+        })();
+        drop(res_rx);
+        drop(credit_tx);
+        let produced = producer.join().expect("payload reader panicked");
+        // a producer error is the cause of a short result
+        produced.and(consumed)?;
+        if !pending.is_empty() {
+            return Err(io::Error::other("payload pipeline stopped early"));
+        }
+        Ok(())
+    })
+}
+
 /// Writes partition `part` of the payload into `out`, decoding its
 /// operations on `threads` threads, and checks its SHA-256. `payload` reads
 /// the whole payload.bin (e.g. a [`Window`] into the OTA zip).
@@ -411,110 +495,68 @@ pub fn dump_partition<R: Read + Seek + Send>(
     out.set_len(part.size)?;
     out.seek(SeekFrom::Start(0))?;
 
-    let threads = threads.max(1);
-    let in_flight = threads * 2;
     let data_offset = info.data_offset;
     let ops = &part.ops;
-    let (job_tx, job_rx) = mpsc::sync_channel::<(usize, Vec<u8>)>(threads);
-    // shared by the decoders; dropped with the last one, which stops the
-    // reader when they quit early
-    let job_rx = Arc::new(Mutex::new(job_rx));
-    let (res_tx, res_rx) = mpsc::channel::<(usize, io::Result<Vec<u8>>)>();
-    // the reader takes a credit per operation, the writer gives it back
-    // once written: at most `in_flight` blobs are in memory
-    let (credit_tx, credit_rx) = mpsc::sync_channel::<()>(in_flight);
-    for _ in 0..in_flight {
-        credit_tx.send(()).unwrap();
-    }
-
+    let mut next_read = 0;
+    let mut next_write = 0;
     let mut hasher = Sha256::new();
     let mut hashed = 0u64;
     let mut in_order = true;
-    std::thread::scope(|s| -> io::Result<()> {
-        let reader = s.spawn(move || -> io::Result<()> {
-            for (i, op) in ops.iter().enumerate() {
-                if credit_rx.recv().is_err() {
-                    break;
-                }
-                let mut data = vec![0u8; op.data_length as usize];
-                if op.data_length > 0 {
-                    payload.seek(SeekFrom::Start(data_offset + op.data_offset))?;
-                    payload.read_exact(&mut data)?;
-                }
-                if job_tx.send((i, data)).is_err() {
-                    break;
-                }
+    let zeros = vec![0u8; 1 << 16];
+    pipeline(
+        threads,
+        || {
+            let Some(op) = ops.get(next_read) else {
+                return Ok(None);
+            };
+            let mut data = vec![0u8; op.data_length as usize];
+            if op.data_length > 0 {
+                payload.seek(SeekFrom::Start(data_offset + op.data_offset))?;
+                payload.read_exact(&mut data)?;
             }
-            Ok(())
-        });
-        for _ in 0..threads {
-            let res_tx = res_tx.clone();
-            let job_rx = Arc::clone(&job_rx);
-            s.spawn(move || loop {
-                let job = job_rx.lock().unwrap().recv();
-                let Ok((i, data)) = job else { break };
-                if res_tx.send((i, decode(&ops[i], data, bs))).is_err() {
-                    break;
-                }
-            });
-        }
-        drop(res_tx);
-        drop(job_rx);
-
+            next_read += 1;
+            Ok(Some((next_read - 1, data)))
+        },
+        |(i, data)| decode(&ops[i], data, bs),
         // write in operation order, hashing while the extents are in order
-        let zeros = vec![0u8; 1 << 16];
-        let mut pending = BTreeMap::new();
-        let mut next = 0;
-        let written = (|| -> io::Result<()> {
-            while next < ops.len() {
-                let Ok((i, data)) = res_rx.recv() else {
-                    return Err(io::Error::other("the payload reader stopped"));
-                };
-                pending.insert(i, data);
-                while let Some(data) = pending.remove(&next) {
-                    let data = data?;
-                    let op = &ops[next];
-                    let mut at = 0usize;
-                    for e in &op.dst_extents {
-                        let pos = e.start * bs;
-                        let len = (e.blocks * bs) as usize;
-                        let zero = data.is_empty();
-                        if !zero {
-                            out.seek(SeekFrom::Start(pos))?;
-                            out.write_all(&data[at..at + len])?;
+        |data| {
+            let op = &ops[next_write];
+            next_write += 1;
+            let zero = data.is_empty();
+            let mut at = 0usize;
+            for e in &op.dst_extents {
+                let pos = e.start * bs;
+                let len = (e.blocks * bs) as usize;
+                if !zero {
+                    out.seek(SeekFrom::Start(pos))?;
+                    out.write_all(&data[at..at + len])?;
+                }
+                if in_order && pos == hashed {
+                    if zero {
+                        let mut left = len;
+                        while left > 0 {
+                            let n = left.min(zeros.len());
+                            hasher.update(&zeros[..n]);
+                            left -= n;
                         }
-                        if in_order && pos == hashed {
-                            if zero {
-                                let mut left = len;
-                                while left > 0 {
-                                    let n = left.min(zeros.len());
-                                    hasher.update(&zeros[..n]);
-                                    left -= n;
-                                }
-                            } else {
-                                hasher.update(&data[at..at + len]);
-                            }
-                            hashed += len as u64;
-                        } else {
-                            in_order = false;
-                        }
-                        if !zero {
-                            at += len;
-                        }
+                    } else {
+                        hasher.update(&data[at..at + len]);
                     }
-                    next += 1;
-                    let _ = credit_tx.send(());
+                    hashed += len as u64;
+                } else {
+                    in_order = false;
+                }
+                if !zero {
+                    at += len;
                 }
             }
             Ok(())
-        })();
-        drop(res_rx);
-        drop(credit_tx);
-        let read = reader.join().expect("payload reader panicked");
-        // a reader error is the cause of a stopped writer
-        read.and(written)
-    })
+        },
+    )
     .map_err(err)?;
+    if next_write != ops.len() {
+        return Err(err(io::Error::other("not all operations were written")));
+    }
     out.flush()?;
 
     if part.hash.is_empty() {
@@ -526,14 +568,7 @@ pub fn dump_partition<R: Read + Seek + Send>(
         // extents out of order or holes left: hash the file
         out.seek(SeekFrom::Start(0))?;
         let mut h = Sha256::new();
-        let mut buf = vec![0u8; 1 << 20];
-        let mut r = (&mut *out).take(part.size);
-        loop {
-            match r.read(&mut buf)? {
-                0 => break,
-                n => h.update(&buf[..n]),
-            }
-        }
+        crate::sign::hash_reader(&mut (&mut *out).take(part.size), |b| h.update(b))?;
         h.finalize()
     };
     if digest[..] != part.hash[..] {
@@ -543,6 +578,331 @@ pub fn dump_partition<R: Read + Seek + Send>(
         )));
     }
     Ok(())
+}
+
+/// Size of the pieces a new image is cut into (`full_update_generator.cc`).
+pub const CHUNK_SIZE: usize = 2 << 20;
+
+/// xz as AOSP's payload generator writes it: no integrity check (each blob
+/// has a SHA-256) and a dictionary no bigger than a chunk.
+fn xz(chunk: &[u8], level: u32) -> io::Result<Vec<u8>> {
+    let mut opts = lzma_rust2::XzOptions::with_preset(level);
+    opts.set_check_sum_type(lzma_rust2::CheckType::None);
+    opts.lzma_options.dict_size = opts.lzma_options.dict_size.min(CHUNK_SIZE as u32);
+    let mut w = lzma_rust2::XzWriter::new(Vec::with_capacity(chunk.len() / 2), opts)?;
+    w.write_all(chunk)?;
+    w.finish()
+}
+
+/// A partition of a new payload.
+#[derive(Debug, Clone, Default)]
+pub struct NewPartition {
+    pub name: String,
+    pub size: u64,
+    pub hash: Vec<u8>,
+    pub ops: Vec<Operation>,
+    /// Rebuilt (the old hashtree, FEC and COW estimates no longer apply)
+    /// or taken over from the old payload.
+    pub rebuilt: bool,
+}
+
+/// Cuts an image into `CHUNK_SIZE` REPLACE_XZ operations (REPLACE where xz
+/// doesn't shrink a chunk, as AOSP does) on `threads` threads, and appends
+/// their blobs to `data`, which already holds `*data_len` bytes. The image
+/// is padded with zeros to a whole block.
+pub fn encode_image<R: Read + Send>(
+    name: &str,
+    image: &mut R,
+    block_size: u64,
+    level: u32,
+    threads: usize,
+    data: &mut impl Write,
+    data_len: &mut u64,
+) -> io::Result<NewPartition> {
+    let bs = block_size as usize;
+    let mut hasher = Sha256::new();
+    let mut size = 0u64;
+    let mut ops = Vec::new();
+    let mut chunk_index = 0u64;
+    pipeline(
+        threads,
+        || {
+            let mut chunk = vec![0u8; CHUNK_SIZE];
+            let mut n = 0;
+            while n < chunk.len() {
+                match image.read(&mut chunk[n..])? {
+                    0 => break,
+                    k => n += k,
+                }
+            }
+            if n == 0 {
+                return Ok(None);
+            }
+            chunk.truncate(n.div_ceil(bs) * bs);
+            hasher.update(&chunk);
+            size += chunk.len() as u64;
+            chunk_index += 1;
+            Ok(Some((chunk_index - 1, chunk)))
+        },
+        |(i, chunk)| {
+            let blocks = (chunk.len() / bs) as u64;
+            let packed = xz(&chunk, level)?;
+            let (kind, blob) = if packed.len() < chunk.len() {
+                (REPLACE_XZ, packed)
+            } else {
+                (REPLACE, chunk)
+            };
+            let op = Operation {
+                kind,
+                data_offset: 0,
+                data_length: blob.len() as u64,
+                src_extents: Vec::new(),
+                dst_extents: vec![Extent {
+                    start: i * (CHUNK_SIZE / bs) as u64,
+                    blocks,
+                }],
+                data_sha256: Sha256::digest(&blob).to_vec(),
+            };
+            Ok((op, blob))
+        },
+        |(mut op, blob)| {
+            op.data_offset = *data_len;
+            data.write_all(&blob)?;
+            *data_len += blob.len() as u64;
+            ops.push(op);
+            Ok(())
+        },
+    )
+    .map_err(|e| io::Error::new(e.kind(), format!("{}: {}", name, e)))?;
+    Ok(NewPartition {
+        name: name.to_string(),
+        size,
+        hash: hasher.finalize().to_vec(),
+        ops,
+        rebuilt: true,
+    })
+}
+
+/// Copies the operations of `part` and their blobs from the old payload,
+/// appending the blobs to `data`.
+pub fn copy_partition<R: Read + Seek>(
+    payload: &mut R,
+    info: &Payload,
+    part: &PartitionUpdate,
+    data: &mut impl Write,
+    data_len: &mut u64,
+) -> io::Result<NewPartition> {
+    let mut ops = Vec::with_capacity(part.ops.len());
+    for op in &part.ops {
+        let mut op = op.clone();
+        if op.data_length > 0 {
+            payload.seek(SeekFrom::Start(info.data_offset + op.data_offset))?;
+            let copied = io::copy(&mut (&mut *payload).take(op.data_length), data)?;
+            if copied != op.data_length {
+                return Err(invalid(format!("{}: payload.bin is truncated", part.name)));
+            }
+            op.data_offset = *data_len;
+            *data_len += op.data_length;
+        }
+        ops.push(op);
+    }
+    Ok(NewPartition {
+        name: part.name.clone(),
+        size: part.size,
+        hash: part.hash.clone(),
+        ops,
+        rebuilt: false,
+    })
+}
+
+/// Encodes the `Signatures` message holding one signature.
+fn signatures_blob(signature: &[u8]) -> Vec<u8> {
+    let mut sig = Writer::new();
+    sig.bytes(2, signature).fixed32(3, signature.len() as u32);
+    let mut w = Writer::new();
+    w.message(1, &sig);
+    w.buf
+}
+
+/// Size of the metadata and payload signature blobs for `key`.
+pub fn signatures_size(key: &Key) -> u64 {
+    signatures_blob(&vec![0u8; key.signature_len()]).len() as u64
+}
+
+// PartitionUpdate fields that only describe the old image: hashtree and
+// FEC (update_engine would write them), merge operations and the COW
+// estimates of Virtual A/B
+const HASH_TREE_FIELDS: std::ops::RangeInclusive<u32> = 10..=16;
+const MERGE_OPERATIONS: u32 = 18;
+const ESTIMATE_COW_SIZE: u32 = 19;
+const ESTIMATE_OP_COUNT_MAX: u32 = 20;
+
+/// Encodes a PartitionUpdate: the fields of `old` (e.g. `version`,
+/// postinstall) with the new image info and operations.
+fn encode_partition(
+    old: Option<&PartitionUpdate>,
+    new: &NewPartition,
+    bs: u64,
+) -> io::Result<Writer> {
+    let mut w = Writer::new();
+    let mut had_cow_estimate = false;
+    let mut had_op_count = false;
+    match old {
+        Some(old) => {
+            for (f, v) in proto::fields(&old.raw)? {
+                match f {
+                    // old image info, new image info, operations, and the
+                    // (unused) per-partition signatures
+                    5..=8 => {}
+                    ESTIMATE_COW_SIZE if new.rebuilt => had_cow_estimate = true,
+                    ESTIMATE_OP_COUNT_MAX if new.rebuilt => had_op_count = true,
+                    MERGE_OPERATIONS if new.rebuilt => {}
+                    f if new.rebuilt && HASH_TREE_FIELDS.contains(&f) => {}
+                    f => {
+                        w.value(f, &v);
+                    }
+                }
+            }
+        }
+        None => {
+            w.string(1, &new.name);
+        }
+    }
+    let mut info = Writer::new();
+    info.varint(1, new.size).bytes(2, &new.hash);
+    w.message(7, &info);
+    for op in &new.ops {
+        w.message(8, &op.encode());
+    }
+    // a full image needs a COW as big as the image, plus the operation
+    // headers: estimate on the safe side
+    if had_cow_estimate {
+        let blocks = new.size.div_ceil(bs);
+        w.varint(ESTIMATE_COW_SIZE, new.size + blocks * 32 + (2 << 20));
+    }
+    if had_op_count {
+        w.varint(ESTIMATE_OP_COUNT_MAX, new.size.div_ceil(bs) + 16);
+    }
+    Ok(w)
+}
+
+/// Encodes a new manifest: the fields of `old` (block size, timestamps,
+/// dynamic partition groups, apex info, OEM fields, ...) with new
+/// partitions and signature location.
+pub fn encode_manifest(
+    old: &Manifest,
+    parts: &[NewPartition],
+    signatures_offset: u64,
+    signatures_size: u64,
+) -> io::Result<Vec<u8>> {
+    let bs = old.block_size as u64;
+    let mut w = Writer::new();
+    let mut parts_written = false;
+    for (f, v) in proto::fields(&old.raw)? {
+        match f {
+            4 | 5 => {}
+            13 => {
+                // the partitions go where the old ones were
+                if !parts_written {
+                    for p in parts {
+                        let enc = encode_partition(old.partition(&p.name), p, bs)?;
+                        w.message(13, &enc);
+                    }
+                    parts_written = true;
+                }
+            }
+            f => {
+                w.value(f, &v);
+            }
+        }
+    }
+    if !parts_written {
+        for p in parts {
+            let enc = encode_partition(old.partition(&p.name), p, bs)?;
+            w.message(13, &enc);
+        }
+    }
+    w.varint(4, signatures_offset).varint(5, signatures_size);
+    Ok(w.buf)
+}
+
+/// `payload_properties.txt` of a payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Properties {
+    pub file_hash: [u8; 32],
+    pub file_size: u64,
+    pub metadata_hash: [u8; 32],
+    pub metadata_size: u64,
+    /// Header + manifest + metadata signature (`payload_metadata.bin`).
+    pub metadata_with_signature: u64,
+}
+
+impl Properties {
+    pub fn text(&self) -> String {
+        format!(
+            "FILE_HASH={}\nFILE_SIZE={}\nMETADATA_HASH={}\nMETADATA_SIZE={}\n",
+            crate::sign::base64(&self.file_hash),
+            self.file_size,
+            crate::sign::base64(&self.metadata_hash),
+            self.metadata_size
+        )
+    }
+}
+
+/// Size of the payload `write_payload` makes.
+pub fn payload_size(manifest: &[u8], data_len: u64, key: &Key) -> u64 {
+    24 + manifest.len() as u64 + 2 * signatures_size(key) + data_len
+}
+
+/// Writes a signed payload.bin: header, `manifest` (made by
+/// [`encode_manifest`] with `signatures_offset = data_len`), metadata
+/// signature, the `data_len` bytes of blobs from `data`, payload signature.
+pub fn write_payload(
+    out: &mut impl Write,
+    manifest: &[u8],
+    data: &mut impl Read,
+    data_len: u64,
+    key: &Key,
+) -> io::Result<Properties> {
+    let sig_size = signatures_size(key);
+    let mut head = Vec::with_capacity(24 + manifest.len());
+    head.extend_from_slice(MAGIC);
+    head.extend_from_slice(&2u64.to_be_bytes());
+    head.extend_from_slice(&(manifest.len() as u64).to_be_bytes());
+    head.extend_from_slice(&(sig_size as u32).to_be_bytes());
+    head.extend_from_slice(manifest);
+    let metadata_hash: [u8; 32] = Sha256::digest(&head).into();
+    let metadata_sig = signatures_blob(&key.sign_sha256(&metadata_hash)?);
+
+    // the payload signature covers the metadata and the blobs, without the
+    // metadata signature; FILE_HASH covers every byte
+    let mut payload_hash = Sha256::new();
+    let mut file_hash = Sha256::new();
+    payload_hash.update(&head);
+    file_hash.update(&head);
+    file_hash.update(&metadata_sig);
+    out.write_all(&head)?;
+    out.write_all(&metadata_sig)?;
+    let mut buf = vec![0u8; 1 << 20];
+    let mut left = data_len;
+    while left > 0 {
+        let n = (left as usize).min(buf.len());
+        data.read_exact(&mut buf[..n])?;
+        payload_hash.update(&buf[..n]);
+        file_hash.update(&buf[..n]);
+        out.write_all(&buf[..n])?;
+        left -= n as u64;
+    }
+    let payload_sig = signatures_blob(&key.sign_sha256(&payload_hash.finalize())?);
+    file_hash.update(&payload_sig);
+    out.write_all(&payload_sig)?;
+    Ok(Properties {
+        file_hash: file_hash.finalize().into(),
+        file_size: payload_size(manifest, data_len, key),
+        metadata_hash,
+        metadata_size: head.len() as u64,
+        metadata_with_signature: (head.len() + metadata_sig.len()) as u64,
+    })
 }
 
 /// Opens the payload in `path` (payload.bin or an OTA zip) as a reader of
@@ -718,6 +1078,80 @@ pub(crate) mod tests {
             .unwrap();
         let p = m.partition("system").unwrap();
         assert!(dump_partition(&mut r, &info, p, &mut f, 2).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn repack_round_trip() {
+        let boot = image(7, 1);
+        let system = image(12, 2);
+        let groups = [Group {
+            name: "main".into(),
+            max_size: 1 << 30,
+            partitions: vec!["system".into()],
+        }];
+        let bin = make_payload(&[("boot", &boot), ("system", &system)], &groups);
+        let mut r = io::Cursor::new(bin);
+        let info = Payload::read(&mut r).unwrap();
+        let m = &info.manifest;
+
+        // boot copied as is, system replaced by a new image
+        let new_system = image(9, 3);
+        let key = Key::test_key().unwrap();
+        let mut data = Vec::new();
+        let mut len = 0;
+        let parts = vec![
+            copy_partition(
+                &mut r,
+                &info,
+                m.partition("boot").unwrap(),
+                &mut data,
+                &mut len,
+            )
+            .unwrap(),
+            encode_image(
+                "system",
+                &mut &new_system[..],
+                4096,
+                0,
+                2,
+                &mut data,
+                &mut len,
+            )
+            .unwrap(),
+        ];
+        assert_eq!(len, data.len() as u64);
+        let manifest = encode_manifest(m, &parts, len, signatures_size(&key)).unwrap();
+        let mut out = Vec::new();
+        let props = write_payload(&mut out, &manifest, &mut &data[..], len, &key).unwrap();
+        assert_eq!(props.file_size, out.len() as u64);
+        assert_eq!(props.file_hash[..], Sha256::digest(&out)[..]);
+        assert_eq!(
+            props.metadata_hash[..],
+            Sha256::digest(&out[..props.metadata_size as usize])[..]
+        );
+        assert!(props.text().starts_with("FILE_HASH="));
+
+        let mut r2 = io::Cursor::new(out.clone());
+        let info2 = Payload::read(&mut r2).unwrap();
+        let m2 = &info2.manifest;
+        m2.check_full().unwrap();
+        assert_eq!(m2.groups, groups);
+        assert_eq!(info2.data_offset, props.metadata_with_signature);
+        let dir = std::env::temp_dir().join(format!("jancox-repack-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, want) in [("boot", &boot), ("system", &new_system)] {
+            let path = dir.join(name);
+            let mut f = File::options()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&path)
+                .unwrap();
+            dump_partition(&mut r2, &info2, m2.partition(name).unwrap(), &mut f, 2).unwrap();
+            assert_eq!(&std::fs::read(&path).unwrap(), want);
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
